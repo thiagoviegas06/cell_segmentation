@@ -1,0 +1,41 @@
+#!/bin/bash
+#SBATCH --job-name=cell_seg_pipeline
+#SBATCH --account=torch_pr_60_tandon_priority
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=4:00:00
+#SBATCH --mem=32GB
+#SBATCH --gres=gpu:h100:1
+#SBATCH --output=logs/%x_%j.out
+#SBATCH --error=logs/%x_%j.err
+#SBATCH --mail-type=END
+#SBATCH --mail-user=tjv235@nyu.edu
+
+set -euo pipefail
+
+mkdir -p logs
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+SIF="/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif"
+OVL="/scratch/tjv235/neuro.ext3"
+
+singularity exec --nv \
+  --overlay "$OVL" \
+  --fakeroot \
+  "$SIF" /bin/bash <<'EOF'
+set -euo pipefail
+
+source /ext3/env.sh
+conda activate my_writable_env
+pip install cellpose
+python -u /scratch/tjv235/cell_segmentation/pipeline.py \
+    --data_root /scratch/pl2820/data/competition \
+    --spots    /scratch/pl2820/data/competition/test_spots.csv \
+    --output   /scratch/tjv235/cell_segmentation/submission.csv \
+    --gpu
+EOF

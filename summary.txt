@@ -1,0 +1,167 @@
+MERFISH Cell Segmentation — Phase 1 Summary
+============================================
+Date: 2026-04-17
+Working dir: /scratch/tjv235/cell_segmentation/
+Competition data: /scratch/pl2820/data/competition/
+
+Goal
+----
+Push local ARI well above the 0.63 Kaggle baseline (currently at 0.62 from
+zero-shot Cellpose cpsam in pipeline.py). Phase 1 deliverable: a local
+validator that scores any segmentation callable against a committed set of
+held-out training FOVs using the *official* metric.
+
+Key Data-Structure Findings (before writing any code)
+-----------------------------------------------------
+1. spots_train.csv has columns:
+     barcode_id, fov, image_row, image_col, global_x, global_y, global_z,
+     x, y, target_gene
+   There is NO cell_id / cluster_id column. The user's spec anticipated one
+   but it does not exist. Ground-truth spot->cell assignment must be derived
+   via point-in-polygon against cell_boundaries_train.csv.
+
+2. cell_boundaries_train.csv has 4082 rows, one per cell, with polygon
+   coordinates as comma-separated strings in columns
+     boundaryX_z{0..4}, boundaryY_z{0..4}
+   Each cell_id (column 'Unnamed: 0', long numeric string) matches exactly the
+   obs/_index in counts_train.h5ad, which is where we pull the cell->FOV map
+   from (obs/fov).
+
+3. Pixel conversion, verified empirically on 10 spots from FOV_019 against the
+   precomputed image_row / image_col columns:
+     image_row = 2048 - (global_x - fov_x) / pixel_size
+     image_col =         (global_y - fov_y) / pixel_size
+   The stage x-axis corresponds to the INVERTED image row, not the column —
+   a common source of silent bugs. Per-FOV (fov_x, fov_y, pixel_size) come
+   from reference/fov_metadata.csv. pixel_size = 0.109 µm/px everywhere.
+
+4. global_z takes exactly 5 integer values {0, 1, 2, 3, 4}. Spot counts:
+   z0: 589K, z1: 606K, z2: 580K, z3: 521K, z4: 362K. So GT rasterization has
+   to be done per-z, not just at the middle plane the current pipeline uses.
+
+5. Official metric (per /scratch/pl2820/data/competition/metric.py):
+   - Input: solution.csv with [spot_id (index), fov, gt_cluster_id]
+            submission.csv with [spot_id (index), fov, cluster_id]
+   - For each fov in solution: adjusted_rand_score(gt, pred) on string labels.
+   - Mean across FOVs. ARI is cluster-ID independent, so the 'cluster_N' vs
+     'FOV_X_cell_N' naming choice doesn't matter numerically.
+   - Missing spots in submission are filled with 'background'.
+   - Organizer-provided generate_submission.py uses 'FOV_X_cell_N' format;
+     we follow the same format for compatibility.
+
+Deliverables — Files Created
+----------------------------
+scripts/build_gt_labels.py
+  One-off GT builder. Rasterizes cell_boundaries_train.csv into a (2048, 2048)
+  int32 mask per (FOV, z) with cv2.fillPoly, then looks up every training
+  spot at its (image_row, image_col, z_idx) to assign a gt_cluster_id.
+  Output: cache/gt_spot_labels.parquet (2,659,359 rows, ~13 MB, 17 s to build).
+  Schema: spot_idx (int64), fov (str), gt_cluster_id (str).
+  Background labels use the literal string 'background'; cell labels use
+  '{fov}_cell_{original_cell_id}'.
+  Overall: 72.8% of all training spots are background (outside any polygon).
+
+scripts/make_val_split.py
+  Deterministic stratified picker. Sorts the 40 training FOVs by cells-per-FOV
+  (ascending; tie-break by spots-per-FOV) and picks 6 at evenly-spaced
+  quantile positions (linspace 0..N-1). Writes val_fovs.txt.
+  Fixed committed split:
+     FOV    cells  spots    GT bg%
+     FOV_012   53  78,605   80.3
+     FOV_013   72  54,197   69.8
+     FOV_031   83  87,881   77.7
+     FOV_015   95  52,204   72.4
+     FOV_032  114  55,973   71.9
+     FOV_019  246  72,619   73.1
+  Spans 53 -> 246 cells (full density range). 401,479 total val spots.
+
+scripts/segmenters.py
+  Factory registry used by local_eval.py. Each factory takes (gpu, diameter)
+  and returns a closure segment(fov_dir: Path) -> (2048, 2048) int mask. The
+  model lives in the closure so it's built once and reused across FOVs.
+  Available factories:
+    build_all_background   — no-op, returns all-zeros. Plumbing smoke test.
+    build_cellpose_zeroshot — wraps pipeline.py's segment_fov with cpsam.
+
+scripts/local_eval.py
+  Main validator. Arguments:
+    --segmenter module.path:factory_name  (required)
+    --val_fovs path  (default val_fovs.txt)
+    --data_root path  (default /scratch/pl2820/data/competition)
+    --gt_labels path  (default cache/gt_spot_labels.parquet)
+    --gpu  (forwarded to the factory)
+    --diameter float  (negative = auto; forwarded to the factory)
+    --save_masks  (dumps predicted masks for debugging)
+    --run_name name  (override runs/<name> dir)
+  Workflow:
+    1. Parse factory spec, build segmenter.
+    2. Load cached GT for val FOVs only.
+    3. For each val FOV: run segmenter, lookup spots in mask, assign
+       '{fov}_cell_N' or 'background'.
+    4. Log per-FOV: n_spots, n_pred_cells, n_gt_cells, pred_bg%, gt_bg%,
+       ARI, seg_seconds.
+    5. Build solution + submission DataFrames and call the organizer's
+       metric.merfish_score VERBATIM (imported from
+       /scratch/pl2820/data/competition/metric.py). This is the headline
+       number. A parallel sklearn-based per-FOV ARI is logged for
+       diagnostics; if the two disagree by > 1e-6, a warning is emitted.
+  Run outputs in runs/<timestamp_or_name>/:
+    config.json  — args + cuda_available + start time
+    eval.log     — full log
+    per_fov.csv  — one row per FOV with the stats above
+    summary.json — mean_ari (official), mean_ari_inline, per_fov_ari
+    masks/<fov>.npy  — only if --save_masks
+
+run_local_eval.sh
+  SLURM launcher: gpu:h100:1, 4 cpus, 32 GB, 2 h wall. Runs inside the
+  existing singularity image and my_writable_env conda env. Passes --gpu by
+  default; forwards any additional arguments to local_eval.py.
+  Invocation: sbatch run_local_eval.sh --run_name phase1_baseline_zeroshot
+
+Verification Performed
+----------------------
+- Cell ID sets between counts_train.h5ad obs/_index and cell_boundaries_train
+  match exactly (4082 in both, intersection 4082, no orphans).
+- Pixel-conversion formula cross-checked on 10 distinct spots in FOV_019;
+  predicted image_row/image_col match the precomputed values to sub-pixel
+  precision (rounding only).
+- GT build succeeds on all 40 FOVs, 2.66 M spots, in 17.2 s total CPU.
+- Smoke test with build_all_background (all-zeros mask) on the 6 val FOVs:
+    mean_ari_inline = 0.0000
+    mean_ari (official metric.merfish_score) = 0.0000
+  Inline and official computations agree bit-exact, confirming the GT join,
+  per-FOV ARI reduction, and submission-shape construction are correct.
+
+Outstanding
+-----------
+- Baseline GPU run still pending. torch.cuda.is_available() is False on the
+  login node, so this must be submitted via SLURM:
+      cd /scratch/tjv235/cell_segmentation
+      sbatch run_local_eval.sh --run_name phase1_baseline_zeroshot
+  Expected outcome: mean ARI near 0.62 on the 6 val FOVs (the current Kaggle
+  baseline for zero-shot cpsam). If the number is substantially off, the val
+  split is unrepresentative of the test distribution and we should widen it
+  before trusting future comparisons.
+
+- Phase 2 (diameter calibration) is blocked on that baseline number, per
+  the user's rule: "Do NOT proceed to Phase 2 until we've confirmed the
+  validator works."
+
+Directory Layout Snapshot
+-------------------------
+/scratch/tjv235/cell_segmentation/
+|- pipeline.py             (UNMODIFIED — as required)
+|- run_pipeline.sh         (UNMODIFIED — existing test-set submission runner)
+|- submission.csv          (pre-existing 0.62 output)
+|- run_local_eval.sh       (NEW — SLURM launcher for validator)
+|- val_fovs.txt            (NEW — committed 6-FOV split)
+|- cache/
+|   |- gt_spot_labels.parquet   (NEW — 2.66 M rows, 13 MB)
+|- runs/
+|   |- smoke_all_bg/            (plumbing check — all 0.0 as expected)
+|   |- smoke_official_metric/   (plumbing check — inline = official)
+|- scripts/
+    |- build_gt_labels.py
+    |- make_val_split.py
+    |- segmenters.py
+    |- local_eval.py
