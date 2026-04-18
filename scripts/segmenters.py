@@ -20,7 +20,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-def build_all_background(gpu: bool = False, diameter: Optional[float] = None):
+def build_all_background(gpu: bool = False, diameter: Optional[float] = None, **_):
     """Factory: returns a segmenter that labels every pixel as background.
 
     Used only to smoke-test local_eval.py plumbing without Cellpose/GPU. ARI
@@ -33,7 +33,7 @@ def build_all_background(gpu: bool = False, diameter: Optional[float] = None):
     return _segment
 
 
-def build_cellpose_zeroshot(gpu: bool = False, diameter: Optional[float] = None):
+def build_cellpose_zeroshot(gpu: bool = False, diameter: Optional[float] = None, **_):
     """Factory: zero-shot Cellpose (cpsam) on polyT+DAPI, single z-plane."""
     from cellpose import models  # imported lazily so non-seg tasks don't need cellpose
     from pipeline import load_fov_images, segment_fov  # reuse existing pipeline funcs
@@ -45,4 +45,38 @@ def build_cellpose_zeroshot(gpu: bool = False, diameter: Optional[float] = None)
         return segment_fov(dapi, polyt, model, diameter=diameter)
 
     _segment.name = f"cellpose_zeroshot(gpu={gpu}, diameter={diameter})"
+    return _segment
+
+
+def build_cellpose_finetuned(
+    gpu: bool = False,
+    diameter: Optional[float] = None,
+    pretrained_model: Optional[str] = None,
+    **_,
+):
+    """Factory: Cellpose loaded from a custom fine-tuned weights file.
+
+    `pretrained_model` is required and must point to a .pt checkpoint produced
+    by scripts/train_cellpose.py (or any cellpose save_model output). Pass via
+    local_eval.py's --segmenter_kwargs flag, e.g.
+        --segmenter_kwargs "pretrained_model=/path/to/runs/<name>/best.pt"
+    """
+    if not pretrained_model:
+        raise ValueError(
+            "build_cellpose_finetuned requires pretrained_model path "
+            "(pass via --segmenter_kwargs pretrained_model=<path>)"
+        )
+    from cellpose import models
+    from pipeline import load_fov_images, segment_fov
+
+    model = models.CellposeModel(gpu=gpu, pretrained_model=pretrained_model)
+
+    def _segment(fov_dir: Path) -> np.ndarray:
+        dapi, polyt = load_fov_images(fov_dir)
+        return segment_fov(dapi, polyt, model, diameter=diameter)
+
+    _segment.name = (
+        f"cellpose_finetuned({Path(pretrained_model).name}, "
+        f"gpu={gpu}, diameter={diameter})"
+    )
     return _segment

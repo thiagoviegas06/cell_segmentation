@@ -116,6 +116,11 @@ def main():
     ap.add_argument("--z_filter", type=int, default=None,
                     help="If set, restrict evaluation to spots with global_z == this "
                          "value. Diagnostic for per-z segmentation lift.")
+    ap.add_argument("--segmenter_kwargs", default=None,
+                    help="Extra keyword args forwarded to the segmenter factory, "
+                         "comma-separated key=value pairs. Example: "
+                         "'pretrained_model=/path/to/best.pt'. Values are strings; "
+                         "factories coerce as needed.")
     args = ap.parse_args()
 
     # Run dir + logging
@@ -147,6 +152,7 @@ def main():
         "diameter": args.diameter,
         "save_masks": args.save_masks,
         "z_filter": args.z_filter,
+        "segmenter_kwargs": args.segmenter_kwargs,
         "cuda_available": cuda_avail,
         "started_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -194,10 +200,20 @@ def main():
     factory_spec = args.segmenter
     factory = load_segmenter_factory(factory_spec)
     diameter = None if (args.diameter is None or args.diameter < 0) else args.diameter
-    log.info("Building segmenter via %s (gpu=%s, diameter=%s)",
-             factory_spec, args.gpu, diameter)
+    extra_kwargs: dict[str, str] = {}
+    if args.segmenter_kwargs:
+        for pair in args.segmenter_kwargs.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(f"Bad --segmenter_kwargs entry (no '='): {pair!r}")
+            k, v = pair.split("=", 1)
+            extra_kwargs[k.strip()] = v.strip()
+    log.info("Building segmenter via %s (gpu=%s, diameter=%s, extra=%s)",
+             factory_spec, args.gpu, diameter, extra_kwargs or "<none>")
     t_model_load = time.time()
-    segment = factory(gpu=args.gpu, diameter=diameter)
+    segment = factory(gpu=args.gpu, diameter=diameter, **extra_kwargs)
     log.info("  factory ready (%s) in %.2fs",
              getattr(segment, "name", "<unnamed>"), time.time() - t_model_load)
 
@@ -307,6 +323,7 @@ def main():
         "gpu": args.gpu,
         "diameter": diameter,
         "z_filter": args.z_filter,
+        "segmenter_kwargs": extra_kwargs or None,
         "val_fovs": val_fovs,
         "mean_ari": round(official_mean_ari, 4),
         "mean_ari_inline": round(mean_ari_inline, 4),

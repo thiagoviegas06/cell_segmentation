@@ -1,6 +1,7 @@
-MERFISH Cell Segmentation — Phase 1 Summary
-============================================
-Date: 2026-04-17
+MERFISH Cell Segmentation — Phases 1–4 Summary
+===============================================
+Date: 2026-04-17 (last updated after Phases 3 & 4 scaffolding; P2/P4 GPU
+runs pending — node availability issues on the cluster)
 Working dir: /scratch/tjv235/cell_segmentation/
 Competition data: /scratch/pl2820/data/competition/
 
@@ -91,6 +92,11 @@ scripts/local_eval.py
     --gt_labels path  (default cache/gt_spot_labels.parquet)
     --gpu  (forwarded to the factory)
     --diameter float  (negative = auto; forwarded to the factory)
+    --z_filter int  (NEW — diagnostic: restrict val spots to one z-plane
+                     only. Filters both spots and GT in lockstep so the
+                     length-match assertion still holds. Intended to
+                     isolate per-z segmentation lift from over-/under-
+                     segmentation errors.)
     --save_masks  (dumps predicted masks for debugging)
     --run_name name  (override runs/<name> dir)
   Workflow:
@@ -116,7 +122,97 @@ run_local_eval.sh
   SLURM launcher: gpu:h100:1, 4 cpus, 32 GB, 2 h wall. Runs inside the
   existing singularity image and my_writable_env conda env. Passes --gpu by
   default; forwards any additional arguments to local_eval.py.
+  Overlay is mounted :ro so multiple jobs can share it concurrently — needed
+  for fan-out runs like the Phase 2 diameter sweep. cellpose is assumed to
+  already be installed in my_writable_env (the pip install step was removed
+  with the :ro switch).
   Invocation: sbatch run_local_eval.sh --run_name phase1_baseline_zeroshot
+
+scripts/compute_diameter.py                                        (Phase 2)
+  Calibrates Cellpose's `diameter` hint from GT polygons. Parses
+  cell_boundaries_train.csv, computes per-cell equivalent-circle diameter
+  d = 2*sqrt(area_px/pi) via the shoelace formula on the stage-µm polygon
+  (area_px = area_µm² / pixel_size² — the affine transform is isotropic so
+  no per-FOV offsets are needed). Defaults to z=2 (the plane pipeline.py
+  currently segments at); --all_z prints per-z stats; --z overrides. Writes
+  the median to reference/diameter_px.txt.
+  Result (z=2, 3774 / 4082 cells with valid polygon, 308 missing):
+    mean=86.38 median=87.68 p25=74.76 p75=98.70 p90=107.79 (all in pixels)
+  Cross-z distributions are tight (median per z: 90.6 / 87.4 / 87.7 / 89.6 /
+  92.7), so z=2 is a fair single estimate.
+
+README.md
+  Per-file guide to the repo: top-level, scripts/, cache/, runs/, logs/,
+  plus conventions (FOV naming, cluster-ID format, pixel conversion, z-plane)
+  and a typical-workflow block.
+
+.gitignore
+  Ignores __pycache__, virtualenvs, run artifacts (runs/, logs/, run.log),
+  the regenerable GT cache (cache/), training_data/ (~2 GB), submission.csv,
+  .claude/, and the usual OS/IDE droppings. Everything under scripts/ and
+  the top-level source + launcher scripts stay tracked.
+
+scripts/prep_training_data.py                                      (Phase 3)
+  Materializes Cellpose fine-tuning inputs. For each training FOV (40 - 6
+  val = 34 FOVs) loads DAPI frame 16 + polyT frame 15, normalizes via
+  pipeline.normalize_image, and rasterizes the z=2 polygon through
+  build_gt_labels.rasterize_fov_z (exact reuse — training masks are
+  bit-identical to what local_eval.py scores against). Writes
+  training_data/<fov_id>.npz with img (H, W, 3) float32 [polyT, DAPI, zeros]
+  and mask (H, W) int32 (0 = bg, 1..N cells). Also renders 4 stratified QC
+  PNGs under training_data/qc/<fov>.png showing DAPI + z=2 polygon outlines.
+  Run result (40.6 s CPU): 34 FOVs prepared, 0 failures, 3419 GT cells ->
+  3177 rasterized at z=2 (7.1% dropout for cells whose z=2 polygon is
+  degenerate/empty). QC overlay on FOV_029 (dense tissue) confirms polygons
+  land on DAPI nuclei throughout.
+
+scripts/segmenters.py  (+ build_cellpose_finetuned)                (Phase 4)
+  Added a second factory, build_cellpose_finetuned(gpu, diameter,
+  pretrained_model, **_), that wraps Cellpose on a custom weights path.
+  Required `pretrained_model` is supplied via local_eval.py's new
+  --segmenter_kwargs flag. Existing factories now accept **_ so they
+  silently ignore unknown kwargs forwarded by local_eval.py.
+
+scripts/local_eval.py  (+ --segmenter_kwargs)                      (Phase 4)
+  New flag: --segmenter_kwargs "key=value,key=value" — parsed into a dict
+  and forwarded to the factory alongside gpu/diameter. Values are kept as
+  strings; factories coerce as needed. Recorded in config.json and
+  summary.json for provenance. Example:
+    --segmenter_kwargs "pretrained_model=/scratch/.../runs/phase4_v1/best.pt"
+
+scripts/train_cellpose.py                                          (Phase 4)
+  Fine-tunes cpsam on the Phase 3 .npz files. Deterministic Phase-4 val
+  pick: sorts the 34 training FOVs by cell count and takes the inner-1/3
+  and inner-2/3 positions as the val set (count=2 by default), leaving 32
+  for training. The Phase 1 val FOVs in val_fovs.txt are NOT used here —
+  they are reserved for final ARI eval on this run's best weights.
+  Calls cellpose.train.train_seg with the requested hyperparameters
+  (n_epochs=100, lr=1e-5, weight_decay=0.1, batch_size=8, normalize=False,
+  channel_axis=-1, save_every=10, save_each=True). After training, the
+  intermediate checkpoint whose eval epoch has the lowest test_loss is
+  promoted to runs/<name>/best.pt; the final-epoch checkpoint is also
+  always kept at runs/<name>/models/<model_name>. SGD flag is exposed for
+  parity with the Phase 4 spec but cellpose v4.0.1+ always uses AdamW.
+  Outputs per run (runs/<name>/):
+    config.json        — all hyperparams + val_fovs + started_at
+    train.log          — full training log (cellpose train_logger + this script)
+    losses.csv         — (epoch, train_loss, test_loss) per epoch
+    models/<name>      — final-epoch checkpoint
+    models/<name>_epoch_NNNN — intermediate checkpoints
+    best.pt            — copy of the best-by-test_loss intermediate
+    summary.json       — best_epoch, best_loss, final losses, val_fovs
+
+run_train_cellpose.sh                                              (Phase 4)
+  SLURM launcher for Phase 4: gpu:h100:1, 8 cpus, 64 GB, 6 h wall. Overlay
+  mounted :ro. Runs training then, on success, invokes local_eval.py with
+  build_cellpose_finetuned pointed at runs/<name>/best.pt plus the
+  Phase-2-calibrated diameter (default 87.68 px; override via EVAL_DIAMETER
+  env var). RUN_NAME env var controls the run dir name (default
+  phase4_<timestamp>). Any flags after the script name are forwarded to
+  train_cellpose.py. Example:
+    RUN_NAME=phase4_v1 sbatch run_train_cellpose.sh
+    RUN_NAME=phase4_v1_lr5e-6 EVAL_DIAMETER=96.45 \
+        sbatch run_train_cellpose.sh --learning_rate 5e-6
 
 Verification Performed
 ----------------------
@@ -132,20 +228,58 @@ Verification Performed
   Inline and official computations agree bit-exact, confirming the GT join,
   per-FOV ARI reduction, and submission-shape construction are correct.
 
+- Phase 1 baseline GPU run (runs/phase1_baseline_zeroshot/) — zero-shot
+  cpsam, auto diameter, 6 val FOVs:
+    mean_ari (official) = 0.4765
+    per-FOV: FOV_012=0.329  FOV_013=0.509  FOV_031=0.384
+             FOV_015=0.705  FOV_032=0.645  FOV_019=0.286
+  Substantially below the 0.62 Kaggle leaderboard number. The worst FOVs are
+  the density extremes (FOV_019 densest at 246 cells, FOV_012 sparsest at
+  53). Per the summary's own rule, this says the 6-FOV split is
+  unrepresentative of the test distribution, not that cpsam is broken —
+  future comparisons should treat the *delta* on this split as the signal
+  and trust the Kaggle LB as the anchor on absolute level.
+
 Outstanding
 -----------
-- Baseline GPU run still pending. torch.cuda.is_available() is False on the
-  login node, so this must be submitted via SLURM:
-      cd /scratch/tjv235/cell_segmentation
-      sbatch run_local_eval.sh --run_name phase1_baseline_zeroshot
-  Expected outcome: mean ARI near 0.62 on the 6 val FOVs (the current Kaggle
-  baseline for zero-shot cpsam). If the number is substantially off, the val
-  split is unrepresentative of the test distribution and we should widen it
-  before trusting future comparisons.
+- Z-plane diagnostic (interleaved with Phase 2). Does restricting the val
+  spots to z=2 only — the plane cpsam actually sees — materially move ARI?
+  If yes, per-z segmentation is a bigger lever than currently estimated and
+  the roadmap should be reordered in favor of it. If no, over-/under-
+  segmentation is the dominant error and diameter/fine-tune remain the
+  right next steps. Runs as:
+      sbatch run_local_eval.sh --run_name phase1_zcheck_z2only --z_filter 2
+  Caveat: pipeline.py loads DAPI_FRAME=16 / POLY_T_FRAME=15 from the .dax,
+  which the project assumes is z=2. Worth verifying the frame->z map before
+  over-interpreting the delta.
 
-- Phase 2 (diameter calibration) is blocked on that baseline number, per
-  the user's rule: "Do NOT proceed to Phase 2 until we've confirmed the
-  validator works."
+- Phase 2 diameter sweep. Submit in parallel (overlay is :ro now):
+      sbatch run_local_eval.sh --run_name phase2_diameter_median --diameter 87.68
+      sbatch run_local_eval.sh --run_name phase2_diameter_0.9x   --diameter 78.91
+      sbatch run_local_eval.sh --run_name phase2_diameter_1.1x   --diameter 96.45
+      sbatch run_local_eval.sh --run_name phase2_diameter_1.2x   --diameter 105.22
+  Expected lift from the base median alone: +0.02 to +0.05 ARI (i.e.
+  landing near 0.50-0.53 on this split). The 1.1x / 1.2x variants test the
+  common-wisdom upward-bias fix for over-segmentation (competition handout
+  Fig 2: Cellpose found 241 cells where GT had 138). Baseline to beat:
+  0.4765. Deliverable: report best diameter + per-FOV breakdown.
+
+- If Phase 2 stalls out near baseline, re-examine the val split before
+  pressing further — the 0.14 gap vs Kaggle LB is large enough that the
+  split itself may be drowning real signal.
+
+- Phase 4 fine-tune + eval. Training data already materialized (2.2 GB in
+  training_data/, 34 FOVs). Run via:
+      cd /scratch/tjv235/cell_segmentation
+      RUN_NAME=phase4_v1 sbatch run_train_cellpose.sh
+  This performs training (~100 epochs of cpsam fine-tune on 32 train FOVs,
+  2 inner-quantile val FOVs), then eval on the 6 Phase 1 val FOVs with
+  diameter=87.68. Expected lift over Phase 2: +0.05 to +0.15 ARI. If mean
+  ARI improves over the best Phase 2 run, promote:
+      cp runs/phase4_v1/best.pt models/finetuned_v1.pt
+  The model/path structure is already set up — fine-tuned weights loaded
+  via build_cellpose_finetuned(pretrained_model=...) factory, which any
+  future eval can reach through local_eval.py --segmenter_kwargs.
 
 Directory Layout Snapshot
 -------------------------
@@ -153,15 +287,28 @@ Directory Layout Snapshot
 |- pipeline.py             (UNMODIFIED — as required)
 |- run_pipeline.sh         (UNMODIFIED — existing test-set submission runner)
 |- submission.csv          (pre-existing 0.62 output)
-|- run_local_eval.sh       (NEW — SLURM launcher for validator)
-|- val_fovs.txt            (NEW — committed 6-FOV split)
+|- run_local_eval.sh       (SLURM launcher for validator — overlay now :ro)
+|- val_fovs.txt            (committed 6-FOV split)
+|- summary.txt             (this file)
+|- README.md               (NEW — per-file repo guide)
+|- .gitignore              (NEW)
+|- reference/
+|   |- diameter_px.txt     (NEW — 87.6760, median GT cell diameter at z=2)
 |- cache/
-|   |- gt_spot_labels.parquet   (NEW — 2.66 M rows, 13 MB)
+|   |- gt_spot_labels.parquet   (2.66 M rows, 13 MB)
+|- training_data/          (NEW — gitignored, 2.2 GB, Phase 3 fine-tune data)
+|   |- FOV_*.npz           (34 files: img + mask per training FOV)
+|   |- qc/                 (4 QC PNGs, DAPI + z=2 polygon outlines)
+|- run_train_cellpose.sh   (NEW — Phase 4 SLURM launcher, train + eval)
 |- runs/
 |   |- smoke_all_bg/            (plumbing check — all 0.0 as expected)
 |   |- smoke_official_metric/   (plumbing check — inline = official)
+|   |- phase1_baseline_zeroshot/ (zero-shot cpsam, mean_ari = 0.4765)
 |- scripts/
     |- build_gt_labels.py
     |- make_val_split.py
-    |- segmenters.py
-    |- local_eval.py
+    |- segmenters.py               (+ build_cellpose_finetuned factory)
+    |- local_eval.py               (+ --z_filter, + --segmenter_kwargs)
+    |- compute_diameter.py         (Phase 2 diameter calibration)
+    |- prep_training_data.py       (NEW — Phase 3 fine-tune data prep)
+    |- train_cellpose.py           (NEW — Phase 4 fine-tuning driver)

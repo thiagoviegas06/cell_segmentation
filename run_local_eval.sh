@@ -33,13 +33,12 @@ OVL="/scratch/tjv235/neuro.ext3"
 PROJECT="/scratch/tjv235/cell_segmentation"
 
 singularity exec --nv \
-  --overlay "$OVL" \
+  --overlay "$OVL":ro \
   --fakeroot \
   "$SIF" /bin/bash -s -- "$@" <<'EOF'
 set -euo pipefail
 source /ext3/env.sh
 conda activate my_writable_env
-pip install --quiet cellpose
 
 cd /scratch/tjv235/cell_segmentation
 python -u scripts/local_eval.py \
