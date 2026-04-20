@@ -19,11 +19,13 @@ run.log
 # Derived caches (rebuilt by scripts/build_gt_labels.py)
 cache/
 
-# Phase 3 fine-tuning inputs (rebuilt by scripts/prep_training_data.py, ~2 GB)
+# Phase 3 v2 fine-tuning inputs (rebuilt by scripts/prep_training_data.py,
+# ~11 GB: 170 multi-z .npz files across 34 train FOVs × 5 z-planes)
 training_data/
 
-# Generated leaderboard output
+# Generated leaderboard outputs
 submission.csv
+submissions/
 
 # Claude Code session state
 .claude/

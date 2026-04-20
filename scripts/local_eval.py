@@ -51,6 +51,7 @@ log = logging.getLogger("local_eval")
 
 IMG_H = 2048
 IMG_W = 2048
+N_Z = 5  # valid global_z values are {0..4}
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +77,30 @@ def load_segmenter_factory(spec: str) -> Callable:
 # Spot -> cluster_id lookup (matches organizer's generate_submission.py format)
 # ---------------------------------------------------------------------------
 def predict_cluster_ids(
-    mask: np.ndarray, fov_id: str, rows: np.ndarray, cols: np.ndarray,
+    mask: np.ndarray,
+    fov_id: str,
+    rows: np.ndarray,
+    cols: np.ndarray,
+    zs: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return per-spot cluster_id string array ('{fov}_cell_{N}' or 'background')."""
+    """Return per-spot cluster_id string array ('{fov}_cell_{N}' or 'background').
+
+    If `mask` is (H, W) each spot is looked up in that single plane (existing
+    behavior). If `mask` is (Z, H, W) each spot is looked up at its own z via
+    `zs`; zs is clamped to [0, Z-1] as a defense against out-of-range values.
+    """
     rows_c = np.clip(rows, 0, IMG_H - 1)
     cols_c = np.clip(cols, 0, IMG_W - 1)
-    cell_ints = mask[rows_c, cols_c]
+    if mask.ndim == 3:
+        if zs is None:
+            raise ValueError("3D mask supplied but zs is None")
+        Z = mask.shape[0]
+        zs_c = np.clip(zs, 0, Z - 1).astype(np.intp)
+        cell_ints = mask[zs_c, rows_c, cols_c]
+    elif mask.ndim == 2:
+        cell_ints = mask[rows_c, cols_c]
+    else:
+        raise ValueError(f"Unexpected mask.ndim={mask.ndim}, shape={mask.shape}")
     out = np.full(len(rows), "background", dtype=object)
     assigned = cell_ints > 0
     if assigned.any():
@@ -185,6 +204,18 @@ def main():
     spots = spots[spots["fov"].isin(val_fovs)].copy()
     log.info("  %d spots across val FOVs", len(spots))
 
+    # Validate global_z range — per-spot 3D lookup depends on it, and the 2D
+    # case also relies on z_filter / frame-map invariants. Out-of-range z is
+    # clamped at lookup time, but we log a warning so silent data issues get
+    # surfaced.
+    z_unique = sorted(spots["global_z"].unique().tolist())
+    z_bad = [z for z in z_unique if z < 0 or z >= N_Z]
+    if z_bad:
+        log.warning("global_z values outside [0,%d): %s — will be clamped",
+                    N_Z, z_bad)
+    else:
+        log.info("  global_z values in spots: %s (all in [0,%d))", z_unique, N_Z)
+
     if args.z_filter is not None:
         before = len(spots)
         spots = spots[spots["global_z"] == args.z_filter].copy()
@@ -241,10 +272,23 @@ def main():
         t_seg = time.time()
         mask = segment(fov_dir)
         seg_time = time.time() - t_seg
-        if mask.shape != (IMG_H, IMG_W):
-            raise ValueError(f"{fov_id}: expected (2048,2048) mask, got {mask.shape}")
+        if mask.ndim == 2:
+            if mask.shape != (IMG_H, IMG_W):
+                raise ValueError(
+                    f"{fov_id}: expected (2048,2048) mask, got {mask.shape}"
+                )
+        elif mask.ndim == 3:
+            if mask.shape[1:] != (IMG_H, IMG_W):
+                raise ValueError(
+                    f"{fov_id}: expected (Z,2048,2048) mask, got {mask.shape}"
+                )
+        else:
+            raise ValueError(
+                f"{fov_id}: mask has unexpected ndim={mask.ndim} shape={mask.shape}"
+            )
         n_pred_cells = int(mask.max())
-        log.info("  segmenter: %d predicted cells, %.2fs", n_pred_cells, seg_time)
+        log.info("  segmenter: %d predicted cells, shape=%s, %.2fs",
+                 n_pred_cells, mask.shape, seg_time)
 
         if args.save_masks:
             np.save(masks_dir / f"{fov_id}.npy", mask.astype(np.int32))
@@ -255,6 +299,7 @@ def main():
             mask, fov_id,
             fov_spots["image_row"].to_numpy(),
             fov_spots["image_col"].to_numpy(),
+            zs=fov_spots["global_z"].to_numpy() if mask.ndim == 3 else None,
         )
         gt_this = gt_by_idx.reindex(fov_spots["spot_idx"].to_numpy()).to_numpy()
 

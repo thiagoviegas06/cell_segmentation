@@ -8,30 +8,48 @@ Phase 1 val_fovs.txt so those remain untouched for final ARI eval), and
 runs cellpose.train.train_seg with the Phase-4 hyperparameters.
 
 Per-epoch train/test loss is logged via cellpose's built-in train_logger to
-runs/<name>/train.log. Intermediate checkpoints are saved every 10 epochs
-(save_each=True), and after training the checkpoint whose eval epoch has the
-lowest test_loss is promoted to runs/<name>/best.pt. The final checkpoint
-(last epoch) is also always kept at runs/<name>/models/<model_name>.
+runs/<name>/train.log. Intermediate checkpoints are saved every
+save_every epochs (default 20) as cellpose's save_each=True files, which
+this script then copies into a normalized layout at runs/<name>/checkpoints/:
+    checkpoints/epoch_NNNN.pt      — one per save_every (weights only)
+    checkpoints/final.pt           — last-epoch weights
+    checkpoints/best.pt            — argmin(val_loss) over saved epochs
+    checkpoints/best_meta.json     — {epoch, train_loss, val_loss, paths}
+Caveats of Option A (no per-epoch hook in cellpose.train.train_seg):
+  - checkpoints contain MODEL WEIGHTS ONLY (no optimizer state → cannot
+    resume mid-run; a crash forces a fresh training job).
+  - val_loss is computed by train_seg only at epoch 5 and every 10
+    epochs thereafter. best.pt is picked among intersection of
+    {save_every epochs} ∩ {eval epochs} — with save_every=20 that's
+    exactly the set of saved epochs.
+  - train_log.csv is reconstructed post-hoc from train_seg's returned
+    arrays; lr is re-derived from the cellpose schedule (pinned to
+    cellpose 4.1.1 semantics).
 
 Alignment notes:
   - Inference via pipeline.segment_fov pre-normalizes with normalize_image
     and calls model.eval(..., normalize=False, channel_axis=2). Training must
     match: we pass normalize=False + channel_axis=-1 so we don't double-
     normalize relative to what the model sees at eval time.
-  - Masks are rasterized at z=2 in prep_training_data.py, matching the
-    single-plane segmentation the model is learning to reproduce.
+  - Training files are FOV_XXX_zK.npz — one per (FOV, z). The val split
+    holds out whole FOVs (all their z-planes) to avoid leakage between
+    train/val at the image level.
 """
 
 import argparse
 import json
 import logging
+import re
 import shutil
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+FOV_Z_RE = re.compile(r"^(FOV_[^_]+)_z(\d+)$")
 
 # Project imports
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -60,6 +78,34 @@ def cell_count_from_mask(mask_path: Path) -> int:
         return int(m.max())
 
 
+def parse_fov_z(stem: str) -> tuple[str, int] | None:
+    """'FOV_001_z2' -> ('FOV_001', 2). Returns None for unrecognized stems."""
+    m = FOV_Z_RE.match(stem)
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+def compute_lr_schedule(learning_rate: float, n_epochs: int) -> np.ndarray:
+    """Replicate cellpose.train.train_seg's internal LR schedule.
+
+    We need the per-epoch LR for train_log.csv because train_seg doesn't
+    expose a callback hook. Logic mirrors cellpose/train.py lines 406-415
+    (version 4.1.1) — if cellpose changes its schedule, this drifts.
+    """
+    LR = np.linspace(0, learning_rate, 10)
+    LR = np.append(LR, learning_rate * np.ones(max(0, n_epochs - 10)))
+    if n_epochs > 300:
+        LR = LR[:-100]
+        for _ in range(10):
+            LR = np.append(LR, LR[-1] / 2 * np.ones(10))
+    elif n_epochs > 99:
+        LR = LR[:-50]
+        for _ in range(10):
+            LR = np.append(LR, LR[-1] / 2 * np.ones(5))
+    return LR[:n_epochs]
+
+
 def load_fov(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
     with np.load(npz_path) as z:
         return z["img"].astype(np.float32), z["mask"].astype(np.int32)
@@ -77,14 +123,17 @@ def main():
     ap.add_argument("--model_name", default="finetuned",
                     help="Cellpose save_model filename inside runs/<name>/models/")
     ap.add_argument("--pretrained_model", default="cpsam")
-    ap.add_argument("--n_epochs", type=int, default=100)
+    ap.add_argument("--n_epochs", type=int, default=200)
     ap.add_argument("--learning_rate", type=float, default=1e-5)
     ap.add_argument("--weight_decay", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--bsize", type=int, default=256,
                     help="Train-time crop size (cellpose default: 256)")
-    ap.add_argument("--save_every", type=int, default=10,
-                    help="Save intermediate checkpoint every N epochs.")
+    ap.add_argument("--save_every", type=int, default=20,
+                    help="Save intermediate checkpoint every N epochs. "
+                         "train_seg also evals val loss at epoch 5 and every "
+                         "10 epochs thereafter — best.pt is picked among eval "
+                         "epochs that also have a saved checkpoint.")
     ap.add_argument("--SGD", action="store_true",
                     help="Requested for API parity; cellpose v4 ignores and "
                          "always uses AdamW.")
@@ -118,40 +167,66 @@ def main():
         log.error("Submit this via SLURM (sbatch run_train_cellpose.sh).")
         sys.exit(2)
 
-    # -- Discover training FOVs --
+    # -- Discover training files (FOV_XXX_zK.npz) --
     data_dir = Path(args.training_data)
-    npzs = sorted(data_dir.glob("FOV_*.npz"))
+    npzs = sorted(data_dir.glob("FOV_*_z*.npz"))
     if not npzs:
-        log.error("No .npz files found under %s — run prep_training_data.py first.", data_dir)
+        log.error("No FOV_*_z*.npz files under %s — run prep_training_data.py first.", data_dir)
         sys.exit(2)
-    fov_ids = [p.stem for p in npzs]
-    log.info("Found %d training FOVs: %s...%s", len(fov_ids), fov_ids[:2], fov_ids[-2:])
+
+    # Group by FOV ID so val split holds out whole FOVs
+    files_by_fov: dict[str, list[Path]] = defaultdict(list)
+    for p in npzs:
+        parsed = parse_fov_z(p.stem)
+        if parsed is None:
+            log.warning("Skipping unrecognized filename: %s", p.name)
+            continue
+        fov_id, _z = parsed
+        files_by_fov[fov_id].append(p)
+
+    fov_ids = sorted(files_by_fov.keys())
+    n_files = sum(len(v) for v in files_by_fov.values())
+    log.info("Found %d .npz files across %d FOVs (avg %.1f z-planes/FOV)",
+             n_files, len(fov_ids), n_files / max(len(fov_ids), 1))
+
+    # -- Per-FOV cell-count ranking (use z=2 if available, else max across z) --
+    log.info("Computing per-FOV cell counts (for stratified val pick)...")
+    cells_per_fov: dict[str, int] = {}
+    for fov, paths in files_by_fov.items():
+        z2 = next((p for p in paths if p.stem.endswith("_z2")), None)
+        if z2 is not None:
+            cells_per_fov[fov] = cell_count_from_mask(z2)
+        else:
+            cells_per_fov[fov] = max(cell_count_from_mask(p) for p in paths)
 
     # -- Pick val split (NOT the Phase 1 val FOVs — those are final-eval only) --
-    log.info("Counting cells per FOV (for stratified val pick)...")
-    cells_per_fov = {p.stem: cell_count_from_mask(p) for p in npzs}
     val_fovs = pick_val_fovs(fov_ids, cells_per_fov, args.val_count)
     val_set = set(val_fovs)
     train_fovs = [f for f in fov_ids if f not in val_set]
     log.info("Phase-4 val FOVs (%d, inner quantiles by cell count): %s",
              len(val_fovs), val_fovs)
-    log.info("  cell counts: %s",
+    log.info("  cell counts (z=2): %s",
              {f: cells_per_fov[f] for f in val_fovs})
-    log.info("Phase-4 train FOVs: %d", len(train_fovs))
+    log.info("Phase-4 train FOVs: %d (%d z-files)", len(train_fovs),
+             sum(len(files_by_fov[f]) for f in train_fovs))
+    log.info("Phase-4 val   FOVs: %d (%d z-files)", len(val_fovs),
+             sum(len(files_by_fov[f]) for f in val_fovs))
 
-    # -- Load all data into memory (2 GB, fits easily on H100 nodes) --
+    # -- Load all data into memory --
     log.info("Loading training arrays into memory...")
     t_load = time.time()
     train_imgs, train_masks = [], []
     for f in train_fovs:
-        img, mask = load_fov(data_dir / f"{f}.npz")
-        train_imgs.append(img)
-        train_masks.append(mask)
+        for p in sorted(files_by_fov[f]):
+            img, mask = load_fov(p)
+            train_imgs.append(img)
+            train_masks.append(mask)
     val_imgs, val_masks = [], []
     for f in val_fovs:
-        img, mask = load_fov(data_dir / f"{f}.npz")
-        val_imgs.append(img)
-        val_masks.append(mask)
+        for p in sorted(files_by_fov[f]):
+            img, mask = load_fov(p)
+            val_imgs.append(img)
+            val_masks.append(mask)
     log.info("  loaded in %.1fs — train_imgs=%d, val_imgs=%d",
              time.time() - t_load, len(train_imgs), len(val_imgs))
 
@@ -170,6 +245,8 @@ def main():
         "val_count": args.val_count,
         "val_fovs": val_fovs,
         "train_fovs_count": len(train_fovs),
+        "train_images_count": len(train_imgs),
+        "val_images_count": len(val_imgs),
         "training_data_dir": str(data_dir),
         "cuda_available": cuda_avail,
         "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -214,48 +291,88 @@ def main():
     log.info("Training complete in %.1fs (= %.1f min). Final saved to %s",
              train_secs, train_secs / 60.0, filename)
 
-    # -- Losses CSV --
-    losses_csv = run_dir / "losses.csv"
-    with open(losses_csv, "w") as fh_out:
-        fh_out.write("epoch,train_loss,test_loss\n")
+    # -- train_log.csv (per-epoch) --
+    # val_loss is only populated at eval epochs (cellpose evals at iepoch==5
+    # and every 10 epochs thereafter); non-eval rows get an empty string.
+    # lr is reconstructed from cellpose's schedule — no per-epoch hook.
+    lr_schedule = compute_lr_schedule(args.learning_rate, args.n_epochs)
+    train_log_path = run_dir / "train_log.csv"
+    with open(train_log_path, "w") as fh_out:
+        fh_out.write("epoch,train_loss,val_loss,lr\n")
         for e in range(args.n_epochs):
-            # test_losses is 0 at non-eval epochs; report blank rather than 0
-            tl = test_losses[e] if test_losses[e] > 0 else ""
-            fh_out.write(f"{e},{train_losses[e]:.6f},{tl}\n")
-    log.info("Wrote losses to %s", losses_csv)
+            vl = f"{test_losses[e]:.6f}" if test_losses[e] > 0 else ""
+            fh_out.write(f"{e},{train_losses[e]:.6f},{vl},{lr_schedule[e]:.8f}\n")
+    log.info("Wrote per-epoch log to %s", train_log_path)
 
-    # -- Promote best checkpoint --
-    # Intermediate checkpoints saved at: save_every, 2*save_every, ..., < n_epochs,
-    # each also an eval epoch (iepoch % 10 == 0). test_losses[e] is populated there.
-    candidate_epochs = [e for e in range(args.save_every, args.n_epochs, args.save_every)
-                        if test_losses[e] > 0]
-    best_info = {}
+    # -- Checkpoint directory: final.pt, epoch_NNNN.pt, best.pt + best_meta.json --
+    ckpt_dir = run_dir / "checkpoints"
+    ckpt_dir.mkdir(exist_ok=True)
+    models_dir = run_dir / "models"
+
+    # FINAL: cellpose writes the last-epoch weights to models/<model_name>
+    final_src = models_dir / args.model_name
+    final_dst = ckpt_dir / "final.pt"
+    if final_src.exists():
+        shutil.copy(final_src, final_dst)
+        log.info("Copied final weights → %s", final_dst)
+    else:
+        log.error("Final weights not found at %s — training may have failed.",
+                  final_src)
+
+    # PERIODIC: copy each intermediate checkpoint to checkpoints/epoch_NNNN.pt.
+    # save_each=True + save_every=N gives files named <model_name>_epoch_NNNN.
+    periodic_re = re.compile(rf"^{re.escape(args.model_name)}_epoch_(\d+)$")
+    periodic_epochs: list[int] = []
+    for src in sorted(models_dir.glob(f"{args.model_name}_epoch_*")):
+        m = periodic_re.match(src.name)
+        if not m:
+            continue
+        ep = int(m.group(1))
+        dst = ckpt_dir / f"epoch_{ep:04d}.pt"
+        shutil.copy(src, dst)
+        periodic_epochs.append(ep)
+    log.info("Copied %d periodic checkpoints: epochs %s",
+             len(periodic_epochs), periodic_epochs)
+
+    # BEST: argmin(val_loss) over epochs that are BOTH eval epochs AND saved.
+    # Eval epochs: {5, 10, 20, ..., (n_epochs//10)*10}. Saved epochs via
+    # save_each: multiples of save_every in (0, n_epochs). With save_every=20,
+    # every saved epoch is also an eval epoch — so candidate set = periodic_epochs.
+    candidate_epochs = [e for e in periodic_epochs if test_losses[e] > 0]
+    best_info: dict = {}
     if candidate_epochs:
         best_epoch = int(min(candidate_epochs, key=lambda e: test_losses[e]))
-        best_loss = float(test_losses[best_epoch])
-        best_src = run_dir / "models" / f"{args.model_name}_epoch_{best_epoch:04d}"
-        best_dst = run_dir / "best.pt"
-        if best_src.exists():
-            shutil.copy(best_src, best_dst)
-            log.info("Best checkpoint = epoch %d (test_loss=%.4f). Copied to %s",
-                     best_epoch, best_loss, best_dst)
-            best_info = {"epoch": best_epoch, "test_loss": best_loss,
-                         "source": str(best_src), "path": str(best_dst)}
-        else:
-            log.warning("Expected best checkpoint not found at %s — "
-                        "falling back to final.", best_src)
-            shutil.copy(run_dir / "models" / args.model_name, run_dir / "best.pt")
-            best_info = {"epoch": args.n_epochs - 1, "test_loss": None,
-                         "source": str(run_dir / "models" / args.model_name),
-                         "path": str(run_dir / "best.pt"),
-                         "note": "intermediate checkpoint missing; used final"}
+        best_val = float(test_losses[best_epoch])
+        best_train = float(train_losses[best_epoch])
+        best_src = ckpt_dir / f"epoch_{best_epoch:04d}.pt"
+        best_dst = ckpt_dir / "best.pt"
+        shutil.copy(best_src, best_dst)
+        log.info("Best checkpoint = epoch %d (val_loss=%.4f). Copied to %s",
+                 best_epoch, best_val, best_dst)
+        best_info = {
+            "epoch": best_epoch,
+            "train_loss": best_train,
+            "val_loss": best_val,
+            "source": str(best_src),
+            "path": str(best_dst),
+        }
+    elif final_src.exists():
+        log.warning("No intermediate eval epochs had val_loss — "
+                    "using final checkpoint as best.")
+        shutil.copy(final_dst, ckpt_dir / "best.pt")
+        best_info = {
+            "epoch": args.n_epochs - 1,
+            "train_loss": float(train_losses[-1]),
+            "val_loss": None,
+            "source": str(final_dst),
+            "path": str(ckpt_dir / "best.pt"),
+            "note": "no eval epochs with val_loss; used final",
+        }
     else:
-        log.warning("No intermediate eval epochs populated — using final checkpoint as best.")
-        shutil.copy(run_dir / "models" / args.model_name, run_dir / "best.pt")
-        best_info = {"epoch": args.n_epochs - 1, "test_loss": None,
-                     "source": str(run_dir / "models" / args.model_name),
-                     "path": str(run_dir / "best.pt"),
-                     "note": "no eval epochs with test_loss; used final"}
+        log.error("No best checkpoint candidate available.")
+
+    (ckpt_dir / "best_meta.json").write_text(json.dumps(best_info, indent=2))
+    log.info("Wrote %s", ckpt_dir / "best_meta.json")
 
     # -- Summary --
     eval_losses = [float(test_losses[e]) for e in range(args.n_epochs)
@@ -272,7 +389,7 @@ def main():
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
     log.info("Wrote %s", run_dir / "summary.json")
-    log.info("DONE. Best weights: %s", run_dir / "best.pt")
+    log.info("DONE. Best weights: %s", ckpt_dir / "best.pt")
 
 
 if __name__ == "__main__":
