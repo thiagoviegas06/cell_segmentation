@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --time=48:00:00
 #SBATCH --mem=64GB
-#SBATCH --gres=gpu:h100:1
-#SBATCH --partition=h100_tandon
+#SBATCH --gres=gpu:h200:1
+#SBATCH --partition=h200_tandon
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-type=END
