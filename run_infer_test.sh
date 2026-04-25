@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=cell_seg_infer
-#SBATCH --account=torch_pr_60_tandon_priority
+#SBATCH --account=torch_pr_173_general
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
