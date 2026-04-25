@@ -31,7 +31,6 @@ singularity exec --nv \
 set -euo pipefail
 
 source /ext3/env.sh
-conda activate my_writable_env
 pip install cellpose
 python -u /scratch/dr3432/cell_segmentation/pipeline.py \
     --data_root /scratch/pl2820/data/competition \

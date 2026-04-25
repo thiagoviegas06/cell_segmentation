@@ -69,7 +69,6 @@ singularity exec --nv \
   "$SIF" /bin/bash -s -- "$RUN_NAME" "$EVAL_DIAMETER" "$@" <<'EOF'
 set -euo pipefail
 source /ext3/env.sh
-conda activate my_writable_env
 
 RUN_NAME="$1"; shift
 EVAL_DIAMETER="$1"; shift
