@@ -10,7 +10,7 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-type=END
-#SBATCH --mail-user=tjv235@nyu.edu
+#SBATCH --mail-user=dr3432@nyu.edu
 
 set -euo pipefail
 
@@ -21,8 +21,8 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-SIF="/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif"
-OVL="/scratch/tjv235/neuro.ext3"
+SIF="/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif"
+OVL="/scratch/dr3432/pytorch/pytorch_env.ext3"
 
 singularity exec --nv \
   --overlay "$OVL" \
@@ -33,9 +33,9 @@ set -euo pipefail
 source /ext3/env.sh
 conda activate my_writable_env
 pip install cellpose
-python -u /scratch/tjv235/cell_segmentation/pipeline.py \
+python -u /scratch/dr3432/cell_segmentation/pipeline.py \
     --data_root /scratch/pl2820/data/competition \
     --spots    /scratch/pl2820/data/competition/test_spots.csv \
-    --output   /scratch/tjv235/cell_segmentation/submission.csv \
+    --output   /scratch/dr3432/cell_segmentation/submission.csv \
     --gpu
 EOF

@@ -83,7 +83,7 @@ def main():
                     help="z-plane whose polygon sets each cell's diameter (default: 2)")
     ap.add_argument(
         "--out",
-        default="/scratch/tjv235/cell_segmentation/reference/diameter_px.txt",
+        default="/scratch/dr3432/cell_segmentation/reference/diameter_px.txt",
     )
     ap.add_argument("--all_z", action="store_true",
                     help="Also print per-z summaries for context.")

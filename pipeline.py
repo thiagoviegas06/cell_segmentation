@@ -357,7 +357,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--output",
-        default="/scratch/tjv235/cell_segmentation/submission.csv",
+        default="/scratch/dr3432/cell_segmentation/submission.csv",
         help="Output path for submission.csv",
     )
     parser.add_argument(

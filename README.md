@@ -135,13 +135,13 @@ RUN_NAME=phase4_v1 sbatch --gres=gpu:h200:1 --time=24:00:00 run_train_cellpose.s
 sbatch run_local_eval.sh \
     --run_name phase4_v1_rerun \
     --segmenter scripts.segmenters:build_cellpose_finetuned \
-    --segmenter_kwargs "pretrained_model=/scratch/tjv235/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
+    --segmenter_kwargs "pretrained_model=/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
 
 # Phase 5 local eval (3D-stitched + per-spot z lookup):
 sbatch run_local_eval.sh \
     --run_name phase5_v1_eval \
     --segmenter scripts.segmenters:build_cellpose_finetuned_3d \
-    --segmenter_kwargs "pretrained_model=/scratch/tjv235/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
+    --segmenter_kwargs "pretrained_model=/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
 
 # Test-set submissions:
 sbatch run_infer_test.sh                   # Phase 4, single z (LB 0.76)

@@ -54,7 +54,7 @@ def pick_stratified(sorted_fovs: list[str], n: int) -> list[str]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default="/scratch/pl2820/data/competition")
-    ap.add_argument("--output", default="/scratch/tjv235/cell_segmentation/val_fovs.txt")
+    ap.add_argument("--output", default="/scratch/dr3432/cell_segmentation/val_fovs.txt")
     ap.add_argument("--n", type=int, default=6)
     args = ap.parse_args()
 

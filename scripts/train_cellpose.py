@@ -115,15 +115,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--training_data",
-        default="/scratch/tjv235/cell_segmentation/training_data",
+        default="/scratch/dr3432/cell_segmentation/training_data",
     )
-    ap.add_argument("--runs_dir", default="/scratch/tjv235/cell_segmentation/runs")
+    ap.add_argument("--runs_dir", default="/scratch/dr3432/cell_segmentation/runs")
     ap.add_argument("--run_name", default=None,
                     help="Subdir under runs/ (default: phase4_<timestamp>)")
     ap.add_argument("--model_name", default="finetuned",
                     help="Cellpose save_model filename inside runs/<name>/models/")
     ap.add_argument("--pretrained_model", default="cpsam")
-    ap.add_argument("--n_epochs", type=int, default=200)
+    ap.add_argument("--n_epochs", type=int, default=300)
     ap.add_argument("--learning_rate", type=float, default=1e-5)
     ap.add_argument("--weight_decay", type=float, default=0.1)
     ap.add_argument("--batch_size", type=int, default=8)

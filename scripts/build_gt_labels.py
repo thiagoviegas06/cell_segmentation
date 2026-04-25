@@ -89,7 +89,7 @@ def rasterize_fov_z(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default="/scratch/pl2820/data/competition")
-    ap.add_argument("--output", default="/scratch/tjv235/cell_segmentation/cache/gt_spot_labels.parquet")
+    ap.add_argument("--output", default="/scratch/dr3432/cell_segmentation/cache/gt_spot_labels.parquet")
     ap.add_argument("--mask_dir", default=None, help="Optional dir to save per-(fov,z) GT masks as .npy")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()

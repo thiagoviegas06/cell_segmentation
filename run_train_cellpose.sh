@@ -11,21 +11,21 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-type=END
-#SBATCH --mail-user=tjv235@nyu.edu
+#SBATCH --mail-user=dr3432@nyu.edu
 
 # Phase 4: fine-tune cpsam on Phase 3 training data, then eval on Phase 1 val FOVs.
 #
 # Default resource request: 1× L40 GPU, 48 h wall time.
 #   - L40 is the best GPU currently reliably available on this cluster for
-#     Phase 4's 200-epoch fine-tune over 160 train images / 10 val images.
+#     Phase 4's 300-epoch fine-tune over 160 train images / 10 val images.
 #   - 48 h is a safety ceiling: an L40 is ~1.5-2× slower than an H100 on
-#     this workload, so real wall time is expected to be 12-20 h. The
+#     this workload, so real wall time is expected to be 18-30 h. The
 #     ceiling is there because Option-A checkpointing has no resume — a
 #     job that gets killed by the time limit loses everything after the
 #     last epoch_NNNN.pt snapshot.
 #
 # Usage:
-#   sbatch run_train_cellpose.sh                              # defaults: 200 epochs, lr 1e-5, wd 0.1, bs 8, save_every 20
+#   sbatch run_train_cellpose.sh                              # defaults: 300 epochs, lr 1e-5, wd 0.1, bs 8, save_every 20
 #   sbatch run_train_cellpose.sh --n_epochs 50                # override a train flag
 #   RUN_NAME=phase4_v1 sbatch run_train_cellpose.sh           # named run
 #   EVAL_DIAMETER=87.68 sbatch run_train_cellpose.sh          # override the diameter used at eval time
@@ -53,9 +53,9 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-SIF="/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif"
-OVL="/scratch/tjv235/neuro.ext3"
-PROJECT="/scratch/tjv235/cell_segmentation"
+SIF="/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif"
+OVL="/scratch/dr3432/pytorch/pytorch_env.ext3"
+PROJECT="/scratch/dr3432/cell_segmentation"
 
 RUN_NAME="${RUN_NAME:-phase4_$(date +%Y%m%d_%H%M%S)}"
 EVAL_DIAMETER="${EVAL_DIAMETER:--1}"
@@ -75,7 +75,7 @@ conda activate my_writable_env
 RUN_NAME="$1"; shift
 EVAL_DIAMETER="$1"; shift
 
-cd /scratch/tjv235/cell_segmentation
+cd /scratch/dr3432/cell_segmentation
 
 # 1) Train
 python -u scripts/train_cellpose.py \
