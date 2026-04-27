@@ -15,6 +15,91 @@ given piece.
 Competition data lives outside this tree at
 `/scratch/pl2820/data/competition/`.
 
+## First-time setup (replicate from a fresh clone)
+
+If you're cloning this repo into your own `/scratch/<netid>/cell_segmentation/`,
+follow these four steps before running any phase. Skipping step 3 is what
+causes the common error
+`FileNotFoundError: ...cache/gt_spot_labels.parquet` — that file is
+gitignored and must be rebuilt locally.
+
+### 1. Prerequisites
+- **Competition data** — read access to the shared tree at
+  `/scratch/pl2820/data/competition/` (no copy needed; everything points at
+  it directly).
+- **Singularity image + conda env** — the launchers expect
+  `/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif` plus an
+  overlay containing the `my_writable_env` conda env (with `cellpose`,
+  `h5py`, `cv2`, `pandas`, `numpy`, `pyarrow`). The original author's overlay
+  lives at `/scratch/tjv235/neuro.ext3`; either ask to share it, build your
+  own, or run the python scripts directly in any equivalent env (the
+  launchers are SLURM convenience wrappers — none of the logic is in them).
+
+### 2. Update hardcoded paths
+Several scripts and SLURM launchers bake `/scratch/tjv235/cell_segmentation/`
+and `/scratch/tjv235/neuro.ext3` into their defaults. After cloning, do a
+project-wide search-and-replace of
+`/scratch/tjv235/cell_segmentation` → your own checkout root, and update
+`OVL=...` in each `run_*.sh` to your overlay path. Files that need
+attention:
+
+| File | What to change |
+| --- | --- |
+| `run_local_eval.sh`, `run_train_cellpose.sh`, `run_infer_test.sh`, `run_infer_test_v2.sh`, `run_pipeline.sh` | `PROJECT=`, `OVL=`, the `cd ...` line, and (for the test-set launchers) `PRETRAINED_MODEL`, `OUTPUT` env-var defaults |
+| `scripts/local_eval.py` | `--val_fovs`, `--gt_labels`, `--runs_dir` defaults |
+| `scripts/build_gt_labels.py` | `--output` default |
+| `scripts/prep_training_data.py` | `--val_fovs`, `--out_dir` defaults |
+| `scripts/train_cellpose.py` | `--data_dir`, `--runs_dir` defaults |
+| `scripts/compute_diameter.py`, `scripts/make_val_split.py` | `--output` defaults (only matters if you re-run them — outputs are committed) |
+| `pipeline.py` | `--output` default |
+
+You can also bypass the defaults by passing explicit `--output`/`--gt_labels`/
+`--val_fovs`/etc. flags on every invocation; the search-and-replace is
+strictly less error-prone.
+
+### 3. Rebuild gitignored artifacts
+What's committed: source, `val_fovs.txt`, `reference/diameter_px.txt`.
+What's NOT committed and must be regenerated locally:
+`cache/`, `training_data/`, `runs/`, `submissions/`, `submission.csv`,
+`logs/`.
+
+Run from the repo root after step 2. Steps 3a is required for *any* local
+eval; 3b is only needed if you're going to fine-tune; 3c is a way to skip
+fine-tuning by reusing the trained checkpoint.
+
+```bash
+# 3a. GT spot labels — REQUIRED for local_eval (~17 s, ~13 MB).
+mkdir -p cache
+python scripts/build_gt_labels.py     # writes cache/gt_spot_labels.parquet
+
+# 3b. Multi-z fine-tuning inputs — only for Phase 3+ training (~5 min, ~11 GB).
+mkdir -p training_data
+python scripts/prep_training_data.py  # writes training_data/FOV_*_z{0..4}.npz
+
+# 3c. (Optional) skip fine-tuning by copying the trained checkpoint.
+#     The Phase 4 weights aren't in git; ask a teammate to share
+#     runs/phase4_v1_h200/checkpoints/best.pt (~few hundred MB) and place it
+#     at the same relative path in your checkout. Both Phase 4 and Phase 5
+#     test-set inference and 6-FOV eval can run from this single checkpoint.
+mkdir -p runs/phase4_v1_h200/checkpoints
+# scp <teammate>:/scratch/<their-netid>/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt \
+#     runs/phase4_v1_h200/checkpoints/best.pt
+```
+
+### 4. Sanity-check the install
+This reproduces the Phase 1 zero-shot baseline (mean ARI **0.4765** on the
+6-FOV val split, ~5 min on an H100):
+
+```bash
+sbatch run_local_eval.sh --run_name sanity_zeroshot
+# When done:
+cat runs/sanity_zeroshot/summary.json     # expect mean_ari ≈ 0.4765
+column -s, -t runs/sanity_zeroshot/per_fov.csv | less -S
+```
+
+If that matches, you're set up correctly. From here see **Typical workflow**
+at the bottom of this README for the per-phase commands.
+
 ## Pipeline at a glance
 
 | Phase | What it does | Primary files | Kaggle LB | Local 6-FOV ARI |
@@ -115,12 +200,17 @@ Safe to prune.
 
 ## Typical workflow
 
+> If you're running this repo for the first time, do **First-time setup**
+> above first — `cache/`, `training_data/`, and `runs/` are all gitignored
+> and must be regenerated before any of the commands below will work.
+
 ```bash
-# One-time setup (already done):
-python scripts/build_gt_labels.py          # cache/gt_spot_labels.parquet
-python scripts/make_val_split.py           # val_fovs.txt
-python scripts/compute_diameter.py         # reference/diameter_px.txt
-python scripts/prep_training_data.py       # training_data/FOV_*_z{0..4}.npz
+# One-time setup (see "First-time setup" above for details and path overrides):
+python scripts/build_gt_labels.py          # cache/gt_spot_labels.parquet (REQUIRED)
+python scripts/prep_training_data.py       # training_data/FOV_*_z{0..4}.npz (only for Phase 3+)
+# val_fovs.txt and reference/diameter_px.txt are committed; only re-run if changing them:
+# python scripts/make_val_split.py
+# python scripts/compute_diameter.py
 
 # Zero-shot / diameter-swept eval (Phases 1–2):
 sbatch run_local_eval.sh --run_name phase1_baseline_zeroshot
