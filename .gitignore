@@ -16,12 +16,18 @@ runs/
 logs/
 run.log
 
-# Derived caches (rebuilt by scripts/build_gt_labels.py)
+# Derived caches (rebuilt by scripts/build_gt_labels.py and the Phase 2
+# scripts under scripts/phase2/, e.g. segment_all.py / build_expression.py)
 cache/
 
 # Phase 3 v2 fine-tuning inputs (rebuilt by scripts/prep_training_data.py,
 # ~11 GB: 170 multi-z .npz files across 34 train FOVs × 5 z-planes)
 training_data/
+
+# In-flight session-state notes, regenerated each session (durable findings
+# go into the README, summary.txt, or memory — handoff.md is for the
+# "what's pending right now" snapshot only).
+handoff.md
 
 # Generated leaderboard outputs
 submission.csv
