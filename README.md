@@ -201,12 +201,14 @@ Training runs contain `config.json` (hyperparams + val_fovs + train/val image co
 
 ## `submissions/`
 
-Kaggle-format outputs written by `infer_test.py` / `pipeline_v2.py` (directory is gitignored).
+Kaggle-format outputs written by `infer_test.py` / `pipeline_v2.py` /
+`scripts/phase2/predict.py` (directory is gitignored).
 
 | File | Produced by | Kaggle LB |
 | --- | --- | --- |
 | `phase4_v1_h200_submission.csv` | `run_infer_test.sh` on `phase4_v1_h200/checkpoints/best.pt` | 0.76 |
-| `phase5_v1_h200_submission.csv` | `run_infer_test_v2.sh` on same checkpoint, 3D-stitched path | pending |
+| `phase5_v1_h200_submission.csv` | `run_infer_test_v2.sh` on same checkpoint, 3D-stitched path | **0.83** |
+| `phase2_v1_baseline.csv` | `scripts/phase2/predict.py` on `runs/phase2_baseline/` (subclass LightGBM, hierarchy rollout) | **0.61** |
 
 ## `logs/`
 
@@ -311,7 +313,7 @@ has the durable rules.
 
 ## Phase 2 runs and submissions
 
-| `runs/phase2_baseline/` | Phase 2 v1 — subclass LightGBM, log1p+L2 + stage coords. Local val mean ARI **0.5554**, Kaggle LB **0.61**. Contains `model.txt` (LightGBM Booster save), `promotion_lookup.csv` (subclass → 4 levels), `feature_meta.json`, `train.log`, `val_predictions.npz`, `val_submission.csv`, `per_class_report.csv`. |
+| `runs/phase2_baseline/` | Phase 2 v1 — subclass LightGBM, log1p+L2 + stage coords. Local val mean ARI **0.5554**, Kaggle LB **0.61**. Contains `model.txt` (LightGBM Booster save), `label_encoder.pkl`, `promotion_lookup.csv` (subclass → 4 levels), `feature_meta.json`, `train_split.json` (which 60/10 FOVs were used), `train.log`, `val_predictions.npz`, `val_submission.csv`, `per_class_report.csv`. |
 | `submissions/phase2_v1_baseline.csv` | The Kaggle submission for Phase 2 v1 (438877 rows). Format-validated against `sample_submission.csv` (matching column order, row count, spot_id ordering, no nulls). |
 
 ## Typical Phase 2 workflow
