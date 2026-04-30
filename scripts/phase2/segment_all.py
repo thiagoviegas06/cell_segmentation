@@ -32,6 +32,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import torch
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -80,23 +81,68 @@ def load_stack(fov_dir: Path) -> np.ndarray:
 
 
 def segment_one(model, fov_dir: Path, stitch_threshold: float,
-                diameter: Optional[float]) -> np.ndarray:
+                diameter: Optional[float]) -> tuple[np.ndarray, np.ndarray]:
     stack = load_stack(fov_dir)
-    masks, _flows, _styles = model.eval(
-        stack,
-        diameter=diameter,
-        channel_axis=-1,
-        z_axis=0,
-        do_3D=False,
-        stitch_threshold=stitch_threshold,
-        normalize=False,
-    )
+
+    # Register forward hook on the final layer of the backbone to capture feature maps
+    feature_maps = []
+    def hook_fn(module, inputs, output):
+        # inputs[0] is the feature map before the final output convolution
+        feature_maps.append(inputs[0].detach().cpu().numpy())
+
+    # In CellposeModel, the resnet backbone is in .net.
+    # The output block is usually the last part of the resnet.
+    hook = model.net.output.register_forward_hook(hook_fn)
+
+    try:
+        masks, _flows, _styles = model.eval(
+            stack,
+            diameter=diameter,
+            channel_axis=-1,
+            z_axis=0,
+            do_3D=False,
+            stitch_threshold=stitch_threshold,
+            normalize=False,
+        )
+    finally:
+        hook.remove()
+
     mask = np.asarray(masks)
     if mask.ndim != 3 or mask.shape != (N_Z, *IMG_HW):
         raise ValueError(
             f"Expected mask of shape (5, 2048, 2048), got {mask.shape}"
         )
-    return mask
+
+    # Extract Per-Cell Embeddings (ROI Pooling)
+    # feature_maps might contain multiple batches if Cellpose tiles or chunks the stack.
+    feat_map = np.concatenate(feature_maps, axis=0)  # Shape: (Z, C, H, W)
+    Z, C, H, W = feat_map.shape
+
+    # If spatial dimensions don't match exactly (e.g. due to padding), resize
+    if (H, W) != IMG_HW:
+        log.warning("Feature map shape %s != %s, resizing for ROI pooling", (H, W), IMG_HW)
+        import cv2
+        # Resize each slice/channel
+        resized = np.empty((Z, C, *IMG_HW), dtype=feat_map.dtype)
+        for z in range(Z):
+            for c in range(C):
+                resized[z, c] = cv2.resize(feat_map[z, c], (IMG_HW[1], IMG_HW[0]),
+                                           interpolation=cv2.INTER_LINEAR)
+        feat_map = resized
+
+    n_cells = int(mask.max())
+    embeddings = np.zeros((n_cells, C), dtype=np.float32)
+
+    # Flatten spatial dims to vectorize masking
+    feat_flat = feat_map.transpose(1, 0, 2, 3).reshape(C, -1)
+    mask_flat = mask.reshape(-1)
+
+    for cell_id in range(1, n_cells + 1):
+        idx = (mask_flat == cell_id)
+        if idx.any():
+            embeddings[cell_id - 1] = feat_flat[:, idx].mean(axis=1)
+
+    return mask, embeddings
 
 
 def to_packed(mask: np.ndarray) -> np.ndarray:
@@ -197,7 +243,7 @@ def main() -> None:
 
         t_fov = time.time()
         try:
-            mask = segment_one(model, fov_dir, args.stitch_threshold, diameter)
+            mask, embeddings = segment_one(model, fov_dir, args.stitch_threshold, diameter)
         except Exception as e:
             log.exception("[%d/%d] %s (%s): FAILED — %s", i + 1, len(all_fovs),
                           fov_id, split, e)
@@ -206,9 +252,13 @@ def main() -> None:
         n_cells = int(mask.max())
         packed = to_packed(mask)
         np.save(out_path, packed)
-        log.info("[%d/%d] %s (%s): %d cells, dtype=%s, saved %s in %.1fs",
+        
+        embed_path = output_dir / f"{fov_id}_embeddings.npy"
+        np.save(embed_path, embeddings)
+        
+        log.info("[%d/%d] %s (%s): %d cells, saved mask + %d-dim embeddings in %.1fs",
                  i + 1, len(all_fovs), fov_id, split, n_cells,
-                 packed.dtype, out_path.name, elapsed)
+                 embeddings.shape[1] if n_cells > 0 else 0, elapsed)
         rows.append({"fov": fov_id, "split": split, "n_cells": n_cells,
                      "seconds": round(elapsed, 2), "skipped": False})
 

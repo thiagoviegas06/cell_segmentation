@@ -224,25 +224,31 @@ def process_fov(
     split: str,
     spots_df: pd.DataFrame,    # already filtered to this FOV
     gene_vocab: list[str],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build (matrix, cell_ids, centroids) for one FOV; save to cache/expression_phase2/."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build (matrix, cell_ids, centroids, embeddings) for one FOV; save to cache/expression_phase2/."""
     mask_path = MASK_DIR / f"{fov_id}.npy"
+    embed_path = MASK_DIR / f"{fov_id}_embeddings.npy"
     if not mask_path.exists():
         raise FileNotFoundError(f"Missing mask: {mask_path}")
+    if not embed_path.exists():
+        raise FileNotFoundError(f"Missing embeddings: {embed_path} — run segment_all.py with --overwrite")
+        
     mask = np.load(mask_path)
+    embeddings = np.load(embed_path)
     matrix, cell_ids = build_expression_matrix(mask, spots_df, gene_vocab)
     centroids = compute_cell_centroids(mask)
+    
     out_path = OUT_DIR / f"{fov_id}.npz"
     np.savez(out_path, matrix=matrix, cell_ids=cell_ids,
-             centroids=centroids, fov_id=np.array(fov_id))
-    return matrix, cell_ids, centroids
+             centroids=centroids, embeddings=embeddings, fov_id=np.array(fov_id))
+    return matrix, cell_ids, centroids, embeddings
 
 
 # ---------------------------------------------------------------------------
 # Step 4: consolidated training set with centroid matching
 # ---------------------------------------------------------------------------
 def build_train_set(
-    fov_to_data: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+    fov_to_data: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
     gt_labels: pd.DataFrame,
     fov_meta: pd.DataFrame,
 ) -> dict:
@@ -252,10 +258,11 @@ def build_train_set(
     centroids_out = []
     match_dists = []
     gt_cell_ids_out = []
+    embeds_out = []
     label_arrays = {lvl: [] for lvl in LABEL_LEVELS}
 
     summary = []
-    for fov_id, (matrix, cell_ids, pred_cent) in sorted(fov_to_data.items()):
+    for fov_id, (matrix, cell_ids, pred_cent, embeddings) in sorted(fov_to_data.items()):
         gt_subset = gt_labels[gt_labels["fov"] == fov_id]
         meta = fov_meta.loc[fov_id]
         if len(gt_subset) == 0:
@@ -287,6 +294,7 @@ def build_train_set(
         centroids_out.append(pred_cent)
         match_dists.append(dists)
         gt_cell_ids_out.append(gt_cell_id_arr)
+        embeds_out.append(embeddings)
         for lvl in LABEL_LEVELS:
             label_arrays[lvl].append(labels_per_level[lvl])
 
@@ -307,6 +315,7 @@ def build_train_set(
         "centroids": np.concatenate(centroids_out, axis=0).astype(np.float32),
         "match_dist_px": np.concatenate(match_dists, axis=0).astype(np.float32),
         "gt_cell_ids": np.concatenate(gt_cell_ids_out, axis=0),
+        "embeddings": np.concatenate(embeds_out, axis=0).astype(np.float32),
         "y_class": np.concatenate(label_arrays["class_label"], axis=0),
         "y_subclass": np.concatenate(label_arrays["subclass_label"], axis=0),
         "y_supertype": np.concatenate(label_arrays["supertype_label"], axis=0),
@@ -378,19 +387,19 @@ def main() -> None:
             matrix = data["matrix"]
             cell_ids = data["cell_ids"]
             centroids = data["centroids"]
-            log.info("[%d/%d] %s (%s): loaded existing  matrix=%s  in_cell_spots≈%d",
+            embeddings = data["embeddings"]
+            log.info("[%d/%d] %s (%s): loaded existing  matrix=%s  embed=%s",
                      i + 1, len(fov_ids_present), fov_id, split,
-                     matrix.shape, int(matrix.sum()))
+                     matrix.shape, embeddings.shape)
         else:
             t_fov = time.time()
-            matrix, cell_ids, centroids = process_fov(fov_id, split, spots_df, gene_vocab)
-            log.info("[%d/%d] %s (%s): %d cells × %d genes, "
-                     "%d in-cell spots, %.1fs",
+            matrix, cell_ids, centroids, embeddings = process_fov(fov_id, split, spots_df, gene_vocab)
+            log.info("[%d/%d] %s (%s): %d cells × %d genes, %d-dim embeddings, %.1fs",
                      i + 1, len(fov_ids_present), fov_id, split,
-                     matrix.shape[0], matrix.shape[1], int(matrix.sum()),
+                     matrix.shape[0], matrix.shape[1], embeddings.shape[1],
                      time.time() - t_fov)
         if split == "train":
-            fov_to_data[fov_id] = (matrix, cell_ids, centroids)
+            fov_to_data[fov_id] = (matrix, cell_ids, centroids, embeddings)
 
     log.info("Per-FOV step done in %.1fs", time.time() - t_total)
 
@@ -410,13 +419,14 @@ def main() -> None:
         centroids=out["centroids"],
         match_dist_px=out["match_dist_px"],
         gt_cell_ids=out["gt_cell_ids"],
+        embeddings=out["embeddings"],
         y_class=out["y_class"],
         y_subclass=out["y_subclass"],
         y_supertype=out["y_supertype"],
         y_cluster=out["y_cluster"],
     )
-    log.info("Saved %s — X_train=%s, %d label arrays",
-             TRAIN_SET_PATH, out["X_train"].shape, len(LABEL_LEVELS))
+    log.info("Saved %s — X_train=%s, embeddings=%s, %d label arrays",
+             TRAIN_SET_PATH, out["X_train"].shape, out["embeddings"].shape, len(LABEL_LEVELS))
 
     # Quick top-line numbers (full report comes from a separate analysis pass).
     n_total = len(out["fov_ids"])

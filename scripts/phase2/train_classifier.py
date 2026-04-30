@@ -37,7 +37,10 @@ import sys
 import time
 from pathlib import Path
 
-import lightgbm as lgb
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 import numpy as np
 import pandas as pd
 from sklearn.metrics import classification_report
@@ -118,6 +121,24 @@ def build_promotion_lookup(labels_df: pd.DataFrame, level: str) -> pd.DataFrame:
     return out
 
 
+class CellTypeClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Phase 2.4 step 1: hierarchy classifier")
     ap.add_argument("--run_dir", default=str(DEFAULT_RUN_DIR))
@@ -154,8 +175,9 @@ def main() -> None:
     y_target = data[label_key].astype(str)     # (N,) string labels
     fov_ids = data["fov_ids"].astype(str)
     centroids = data["centroids"].astype(np.float32)
-    log.info("  X_train shape=%s, training on %s (unique=%d), FOVs=%d",
-             X_raw.shape, args.label_level, len(np.unique(y_target)), len(np.unique(fov_ids)))
+    X_embed = data["embeddings"].astype(np.float32)
+    log.info("  X_train shape=%s, embeddings=%s, training on %s (unique=%d), FOVs=%d",
+             X_raw.shape, X_embed.shape, args.label_level, len(np.unique(y_target)), len(np.unique(fov_ids)))
 
     val_fovs = [ln.strip() for ln in open(VAL_FOVS_PATH) if ln.strip()]
     log.info("Val FOVs (%d): %s", len(val_fovs), val_fovs)
@@ -163,10 +185,10 @@ def main() -> None:
     fov_meta = pd.read_csv(FOV_META_CSV).set_index("fov")
 
     # ---- Feature pipeline
-    log.info("Building features (log1p + L2 normalize + 2 stage coords)...")
+    log.info("Building features (log1p + L2 normalize + 2 stage coords + embeddings)...")
     X_norm = normalize_counts(X_raw)                          # (N, 1147)
     stage = stage_xy(centroids, fov_ids, fov_meta)            # (N, 2)
-    X = np.concatenate([X_norm, stage], axis=1).astype(np.float32)
+    X = np.concatenate([X_norm, stage, X_embed], axis=1).astype(np.float32)
     log.info("  X.shape=%s", X.shape)
 
     # Group split: cells from val FOVs go to val
@@ -208,48 +230,86 @@ def main() -> None:
                  weights_per_class.min(), float(np.median(weights_per_class)),
                  weights_per_class.max())
 
-    # ---- Train LightGBM
+    # ---- Train PyTorch MLP
     n_classes = len(le.classes_)
-    log.info("Training LightGBM multiclass: n_classes=%d, n_estimators=%d, lr=%.3f, "
-             "max_depth=%d, num_leaves=%d, early_stop=%d",
-             n_classes, args.n_estimators, args.learning_rate,
-             args.max_depth, args.num_leaves, args.early_stopping_rounds)
+    log.info("Training PyTorch MLP: input_dim=%d, n_classes=%d, epochs=%d, lr=%.3f, early_stop=%d",
+             X.shape[1], n_classes, args.n_estimators, args.learning_rate, args.early_stopping_rounds)
 
-    train_set = lgb.Dataset(X_tr, label=y_tr, weight=sample_weight)
-    val_set = lgb.Dataset(X_va, label=y_va, reference=train_set)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CellTypeClassifier(input_dim=X.shape[1], num_classes=n_classes).to(device)
 
-    params = {
-        "objective": "multiclass",
-        "num_class": n_classes,
-        "learning_rate": args.learning_rate,
-        "max_depth": args.max_depth,
-        "num_leaves": args.num_leaves,
-        "min_data_in_leaf": args.min_data_in_leaf,
-        "metric": "multi_logloss",
-        "verbosity": -1,
-        "num_threads": args.num_threads,
-    }
+    # Convert to tensors
+    X_tr_t = torch.from_numpy(X_tr)
+    y_tr_t = torch.from_numpy(y_tr).long()
+    X_va_t = torch.from_numpy(X_va)
+    y_va_t = torch.from_numpy(y_va).long()
+
+    # Per-row sample weights
+    weight_tensor = None
+    if args.use_balanced_weights:
+        cls_counts = np.bincount(y_tr, minlength=n_classes).astype(np.float64)
+        weights_per_class = len(y_tr) / (np.maximum(cls_counts, 1) * n_classes)
+        weight_tensor = torch.from_numpy(weights_per_class).float().to(device)
+        log.info("  balanced weight_tensor: min=%.3f median=%.3f max=%.3f",
+                 weights_per_class.min(), float(np.median(weights_per_class)), weights_per_class.max())
+
+    criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    
+    train_loader = DataLoader(TensorDataset(X_tr_t, y_tr_t), batch_size=256, shuffle=True)
+
+    best_val_loss = float("inf")
+    best_epoch = -1
+    early_stop_counter = 0
+    model_path = run_dir / "model.pt"
 
     t0 = time.time()
-    model = lgb.train(
-        params,
-        train_set,
-        num_boost_round=args.n_estimators,
-        valid_sets=[train_set, val_set],
-        valid_names=["train", "val"],
-        callbacks=[
-            lgb.early_stopping(args.early_stopping_rounds, verbose=False),
-            lgb.log_evaluation(period=20),
-        ],
-    )
-    log.info("LightGBM trained in %.1fs (best_iter=%d, best_val_logloss=%.4f)",
-             time.time() - t0, model.best_iteration, model.best_score["val"]["multi_logloss"])
+    for epoch in range(args.n_estimators):
+        model.train()
+        train_loss = 0.0
+        for bx, by in train_loader:
+            bx, by = bx.to(device), by.to(device)
+            optimizer.zero_grad()
+            out = model(bx)
+            loss = criterion(out, by)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * bx.size(0)
+        train_loss /= len(X_tr)
+
+        model.eval()
+        with torch.no_grad():
+            va_out = model(X_va_t.to(device))
+            val_loss = criterion(va_out, y_va_t.to(device)).item()
+
+        if (epoch + 1) % 20 == 0 or epoch == 0:
+            log.info("Epoch %3d/%d: train_loss=%.4f  val_loss=%.4f",
+                     epoch + 1, args.n_estimators, train_loss, val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            early_stop_counter = 0
+            torch.save(model.state_dict(), model_path)
+        else:
+            early_stop_counter += 1
+            if early_stop_counter >= args.early_stopping_rounds:
+                log.info("Early stopping at epoch %d (best epoch %d, best val_loss %.4f)",
+                         epoch + 1, best_epoch + 1, best_val_loss)
+                break
+
+    log.info("PyTorch MLP trained in %.1fs (best_epoch=%d, best_val_loss=%.4f)",
+             time.time() - t0, best_epoch + 1, best_val_loss)
 
     # ---- Eval on val
-    log.info("Predicting val...")
-    val_proba = model.predict(X_va, num_iteration=model.best_iteration)  # (n_val, n_classes)
-    val_pred_idx = val_proba.argmax(axis=1)
-    val_pred_str = le.classes_[val_pred_idx]
+    log.info("Predicting val (using best model)...")
+    model.load_state_dict(torch.load(model_path))
+    model.eval()
+    with torch.no_grad():
+        val_logits = model(X_va_t.to(device))
+        val_proba = torch.softmax(val_logits, dim=1).cpu().numpy()
+        val_pred_idx = val_proba.argmax(axis=1)
+        val_pred_str = le.classes_[val_pred_idx]
 
     # Per-class report (string labels, on val)
     log.info("=== Per-class precision/recall (val, cluster level) ===")
@@ -273,17 +333,16 @@ def main() -> None:
         log.info("ACCURACY %.3f", float(rep_df.loc["accuracy"]["f1-score"]))
 
     # ---- Save artifacts
-    model_path = run_dir / "model.txt"
-    model.save_model(str(model_path), num_iteration=model.best_iteration)
-    log.info("Saved model -> %s", model_path)
+    # model.pt was already saved during training (best epoch)
+    log.info("Best model saved -> %s", model_path)
 
     with open(run_dir / "label_encoder.pkl", "wb") as f:
         pickle.dump(le, f)
 
     feat_meta = {
         "n_genes": X_norm.shape[1],
-        "n_extra_features": stage.shape[1],
-        "extra_feature_names": ["global_x_um", "global_y_um"],
+        "n_extra_features": stage.shape[1] + X_embed.shape[1],
+        "extra_feature_names": ["global_x_um", "global_y_um", f"{X_embed.shape[1]}D_cellpose_embed"],
         "normalization": "log1p_then_l2",
         "pixel_size_um": PIXEL_SIZE,
     }
@@ -296,8 +355,8 @@ def main() -> None:
         "n_val_cells": int(val_mask.sum()),
         "n_train_clusters": int(len(np.unique(y_tr_str))),
         "n_val_clusters": int(len(np.unique(y_va_str))),
-        "best_iteration": int(model.best_iteration),
-        "best_val_multi_logloss": float(model.best_score["val"]["multi_logloss"]),
+        "best_epoch": int(best_epoch + 1),
+        "best_val_loss": float(best_val_loss),
     }
     with open(run_dir / "train_split.json", "w") as f:
         json.dump(split_meta, f, indent=2)

@@ -39,11 +39,29 @@ import sys
 import time
 from pathlib import Path
 
-import lightgbm as lgb
+import torch
+import torch.nn as nn
 import numpy as np
 import pandas as pd
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+class CellTypeClassifier(nn.Module):
+    def __init__(self, input_dim, num_classes):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 LABEL_LEVELS = ["class_label", "subclass_label", "supertype_label", "cluster_label"]
 SUBMISSION_LEVELS = ["class", "subclass", "supertype", "cluster"]
@@ -85,17 +103,14 @@ def stage_xy(centroids: np.ndarray, fov_x: float, fov_y: float) -> np.ndarray:
 
 def predict_fov_cell_labels(
     fov_id: str,
-    model: lgb.Booster,
+    model: nn.Module,
     label_classes: np.ndarray,
     promotion: pd.DataFrame,
     fov_meta: pd.DataFrame,
+    device: torch.device,
 ) -> dict:
     """
     Returns dict cell_id -> {class, subclass, supertype, cluster}.
-    cell_id is the 1-indexed mask label. The classifier may have been
-    trained at any of the 4 hierarchy levels — `promotion` maps each
-    predicted value to all 4 columns (deterministic parent + most-common
-    child rollouts).
     """
     expr_path = EXPR_DIR / f"{fov_id}.npz"
     if not expr_path.exists():
@@ -104,6 +119,7 @@ def predict_fov_cell_labels(
     matrix = data["matrix"]
     cell_ids = data["cell_ids"]
     centroids = data["centroids"]
+    embeddings = data["embeddings"]
     n = len(cell_ids)
     if n == 0:
         return {}
@@ -111,9 +127,14 @@ def predict_fov_cell_labels(
     X_norm = normalize_counts(matrix)
     m = fov_meta.loc[fov_id]
     stage = stage_xy(centroids, m.fov_x, m.fov_y)
-    X = np.concatenate([X_norm, stage], axis=1).astype(np.float32)
+    X = np.concatenate([X_norm, stage, embeddings], axis=1).astype(np.float32)
 
-    proba = model.predict(X)
+    model.eval()
+    with torch.no_grad():
+        X_t = torch.from_numpy(X).to(device)
+        logits = model(X_t)
+        proba = torch.softmax(logits, dim=1).cpu().numpy()
+        
     pred_idx = proba.argmax(axis=1)
     pred_label = label_classes[pred_idx]
 
@@ -203,13 +224,19 @@ def main() -> None:
     log.info("Predicting %d FOV(s): %s", len(fovs), fovs)
 
     log.info("Loading model + encoder + promotion lookup from %s", run_dir)
-    model = lgb.Booster(model_file=str(run_dir / "model.txt"))
     with open(run_dir / "label_encoder.pkl", "rb") as f:
         le = pickle.load(f)
     label_classes = np.asarray(le.classes_)
     feat_meta = json.loads((run_dir / "feature_meta.json").read_text())
     trained_level = feat_meta.get("trained_label_level", "cluster_label")
     promotion = pd.read_csv(run_dir / "promotion_lookup.csv").set_index(trained_level, drop=False)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    input_dim = feat_meta["n_genes"] + feat_meta["n_extra_features"]
+    model = CellTypeClassifier(input_dim, len(label_classes)).to(device)
+    model.load_state_dict(torch.load(run_dir / "model.pt", map_location=device))
+    model.eval()
+    
     log.info("  model classes=%d, promotion entries=%d, trained at %s",
              len(label_classes), len(promotion), trained_level)
 
@@ -234,7 +261,7 @@ def main() -> None:
             log.warning("  %s: 0 spots in spot table", fov)
             continue
         cell_labels = predict_fov_cell_labels(fov, model, label_classes,
-                                               promotion, fov_meta)
+                                               promotion, fov_meta, device)
         sub_fov = build_submission_for_fov(fov, cell_labels, spots_fov)
         pieces.append(sub_fov)
     log.info("Per-FOV inference done in %.1fs", time.time() - t_total)

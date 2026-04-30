@@ -7,9 +7,10 @@ Working directory for the two-phase MERFISH Kaggle task:
   **0.83** (see "Phase 1 — segmentation: pipeline at a glance" below).
 - **Competition Phase 2 — cell-type classification.** Predict 4-level
   Allen Brain Cell Atlas labels per spot (class / subclass / supertype /
-  cluster) using the Phase 1 segmentation as a fixed input. Subclass
-  LightGBM baseline currently **0.61 LB** (see "Phase 2 — cell-type
-  classification" near the bottom).
+  cluster) using the Phase 1 segmentation as a fixed input.
+  - Subclass LightGBM baseline: **0.61 LB** (v1).
+  - PyTorch MLP with deep Cellpose embeddings: **Pending LB** (v2).
+  (See "Phase 2 — cell-type classification" near the bottom).
 
 The original end-to-end Phase 1 pipeline (`pipeline.py`) produces a
 zero-shot `submission.csv` for the public leaderboard; everything under
@@ -147,6 +148,7 @@ Phase 2), see further down.
 | `val_fovs.txt` | Committed 6-FOV validation split for the Phase 1 segmentation work (stratified across cell-density range). Consumed by `local_eval.py` via `--val_fovs`. Distinct from the Phase 2 split (`phase2_val_fovs.txt`) and from `train_cellpose.py`'s in-training val split. |
 | `phase2_val_fovs.txt` | Committed 10-FOV validation split for **Phase 2 (cell-type classification)**, stratified by cell count from `cache/masks_phase2/cell_counts.csv`. Excludes FOV_147 (kept in train because it holds 100% of `29 CB Glut` cells). Consumed by `scripts/phase2/train_classifier.py` and `scripts/phase2/local_eval_phase2.py`. |
 | `run_segment_all_phase2.sh` | SLURM launcher (1×L40S, 2 h) for `scripts/phase2/segment_all.py` — bulk 3D-stitched segmentation of all 70 Phase 2 FOVs (60 train + 10 test). Env vars: `PRETRAINED_MODEL`, `DATA_ROOT`, `OUTPUT_DIR`, `STITCH_THRESHOLD`, `DIAMETER`. Forwards extra args (e.g. `--fovs FOV_E` for a smoke test). |
+| `run_phase2_full_pipeline.sh` | End-to-end Phase 2 launcher: handles segmentation + embedding extraction, data building, PyTorch training, and inference in one job. Use `--overwrite` to force re-extraction of embeddings. |
 | `run.log` | Log from an early pipeline run, kept only for reference. |
 
 ## `scripts/`
@@ -287,34 +289,43 @@ has the durable rules.
 | Sub-phase | What it does | Primary files | Kaggle LB | Local val (mean ARI) |
 | --- | --- | --- | --- | --- |
 | 2.1 | Data discovery (schemas, gene panels, label hierarchy, normalization) | (offline analysis only) | — | — |
-| 2.2 | Re-segment all 70 Phase 2 FOVs with the Phase 1 fine-tuned model | `scripts/phase2/segment_all.py`, `run_segment_all_phase2.sh` | — | n/a (segmentation step) |
+| 2.2 | Re-segment all 70 Phase 2 FOVs + extract deep embeddings | `scripts/phase2/segment_all.py`, `run_segment_all_phase2.sh` | — | n/a |
 | 2.3 | Per-cell gene-expression vectors + GT centroid matching | `scripts/phase2/build_expression.py` | — | 76% match rate |
-| 2.4 v1 | LightGBM subclass classifier + deterministic hierarchy rollout | `scripts/phase2/{train_classifier,predict,local_eval_phase2}.py` | **0.61** | 0.5554 |
+| 2.4 v1 | LightGBM subclass classifier + deterministic hierarchy rollout | `scripts/phase2/{train_classifier,predict}.py` | **0.61** | 0.5554 |
+| 2.4 v2 | PyTorch MLP with deep Cellpose embeddings | `scripts/phase2/{train_classifier,predict}.py`, `run_phase2_full_pipeline.sh` | **Pending** | TBD |
 
 ## `scripts/phase2/`
 
 | File | Purpose |
 | --- | --- |
-| `segment_all.py` | 3D-stitched cellpose inference over all 70 Phase 2 FOVs using the Phase 1 fine-tuned checkpoint (`runs/phase4_v1_h200/checkpoints/best.pt`). Same `model.eval(stitch_threshold=0.3, channel_axis=-1, z_axis=0, do_3D=False, normalize=False)` as `pipeline_v2.py`. Saves uint16 `(5, 2048, 2048)` masks to `cache/masks_phase2/<FOV>.npy` plus a `cell_counts.csv`. Resumes (skips already-saved FOVs) unless `--overwrite`. |
-| `build_expression.py` | For each FOV, builds a `(n_cells, 1147)` int32 gene-count matrix by per-spot mask lookup. Drops `blank-*` decoys. Computes per-cell `(image_row, image_col)` centroids via scipy `center_of_mass`. Then assembles `cache/phase2_train.npz` for the 60 train FOVs with labels assigned by nearest-GT-centroid matching (≤30 px → inherit GT label; else `background`). Also writes `cache/gene_vocab.json`. |
-| `train_classifier.py` | LightGBM multiclass trainer. `--label_level` chooses which hierarchy level to train on (default `subclass_label` — `cluster_label` is too sparse with 178 classes / 5390 cells, collapses to predict-background). Features: log1p-then-L2-normalized gene counts + `(global_x, global_y)` stage centroid (CCF coords aren't available for test cells). Per-row inverse-class-frequency `sample_weight` (sklearn-style `class_weight='balanced'` is silently ignored by `lgb.train`). Saves `model.txt`, `label_encoder.pkl`, `promotion_lookup.csv`, `train.log`, `val_predictions.npz`, `per_class_report.csv` under `runs/<run_name>/`. |
-| `predict.py` | Per-FOV inference + per-spot mask lookup → 4-column submission CSV. Reads `runs/<run_name>/{model.txt,label_encoder.pkl,promotion_lookup.csv,feature_meta.json}`. Promotes the predicted label to all 4 hierarchy levels via the run's `promotion_lookup.csv` (deterministic strict-hierarchy parents + most-common-within-group children). Per-spot lookup uses `cache/masks_phase2/<FOV>.npy[global_z, image_row, image_col]` — `cell_id == 0` → all-background. `--no_sample_align` for val runs (don't reorder against `sample_submission.csv`). |
-| `local_eval_phase2.py` | Phase 2 validator wrapping the official `metric.merfish_score`. Builds per-spot GT for the 10 val FOVs by rasterizing `cell_boundaries_train.csv` per `(FOV, z)` and looking up val spots. Prints overall mean ARI and per-level breakdown (per-FOV ARIs at each level). |
+| `segment_all.py` | 3D-stitched cellpose inference + **deep embedding extraction** (ROI pooling via forward hook). Saves uint16 masks to `cache/masks_phase2/<FOV>.npy` and float32 embeddings to `<FOV>_embeddings.npy`. Resumes (skips already-saved FOVs) unless `--overwrite`. |
+| `build_expression.py` | Builds `(n_cells, 1147)` gene-count matrices and integrates the 32-dim deep embeddings. Assembles `cache/phase2_train.npz` with labels assigned by nearest-GT-centroid matching. |
+| `train_classifier.py` | PyTorch MLP trainer (replaces LightGBM). Trains on `[log1p_L2_gene_counts, stage_coords, deep_embeddings]`. Features early stopping and validation loss tracking. Saves `model.pt`, `label_encoder.pkl`, `promotion_lookup.csv`, etc., under `runs/<run_name>/`. |
+| `predict.py` | Per-FOV PyTorch inference + per-spot mask lookup → 4-column submission CSV. Loads `model.pt` and `feature_meta.json`. |
+| `local_eval_phase2.py` | Phase 2 validator wrapping the official `metric.merfish_score`. |
 
 ## Phase 2 cache files (under `cache/`, all gitignored)
 
 | Path | Purpose | Approx size |
 | --- | --- | --- |
-| `gene_vocab.json` | 1147 gene names in `counts.var._index` order. Built by `build_expression.py` and reused by `train_classifier.py` / `predict.py`. | 11 KB |
-| `masks_phase2/<FOV>.npy` (×70) | uint16 `(5, 2048, 2048)` cellpose masks. | ~40 MB each |
-| `masks_phase2/cell_counts.csv` | Per-FOV cell counts (`fov, split, n_cells, seconds, skipped`). | 4 KB |
-| `expression_phase2/<FOV>.npz` (×70) | Per-FOV `matrix (n_cells, 1147) int32`, `cell_ids`, `centroids`, `fov_id`. | ~50 KB-1 MB each |
-| `phase2_train.npz` | Consolidated 60-train-FOV labeled set: `X_train (6420, 1147)`, `fov_ids`, `cell_ids`, `centroids`, `match_dist_px`, `gt_cell_ids`, `y_class/y_subclass/y_supertype/y_cluster`. | 30 MB |
+| `gene_vocab.json` | 1147 gene names in `counts.var._index` order. | 11 KB |
+| `masks_phase2/<FOV>.npy` | uint16 `(5, 2048, 2048)` cellpose masks. | ~40 MB |
+| `masks_phase2/<FOV>_embeddings.npy` | float32 `(n_cells, 32)` deep Cellpose embeddings. | ~10-100 KB |
+| `masks_phase2/cell_counts.csv` | Per-FOV cell counts. | 4 KB |
+| `expression_phase2/<FOV>.npz` | Per-FOV matrix, cell_ids, centroids, and embeddings. | ~100 KB-1 MB |
+| `phase2_train.npz` | Consolidated labeled set (60 FOVs) including embeddings. | ~40 MB |
 
 ## Phase 2 runs and submissions
 
-| `runs/phase2_baseline/` | Phase 2 v1 — subclass LightGBM, log1p+L2 + stage coords. Local val mean ARI **0.5554**, Kaggle LB **0.61**. Contains `model.txt` (LightGBM Booster save), `label_encoder.pkl`, `promotion_lookup.csv` (subclass → 4 levels), `feature_meta.json`, `train_split.json` (which 60/10 FOVs were used), `train.log`, `val_predictions.npz`, `val_submission.csv`, `per_class_report.csv`. |
-| `submissions/phase2_v1_baseline.csv` | The Kaggle submission for Phase 2 v1 (438877 rows). Format-validated against `sample_submission.csv` (matching column order, row count, spot_id ordering, no nulls). |
+| Run | Description |
+| --- | --- |
+| `runs/phase2_baseline/` | Phase 2 v1 — subclass LightGBM, log1p+L2 + stage coords. Local val mean ARI **0.5554**, Kaggle LB **0.61**. |
+| `runs/phase2_pytorch/` | Phase 2 v2 — PyTorch MLP + Cellpose Embeddings. Uses the full 32-dim feature set extracted from the backbone. |
+
+| Submission | Description |
+| --- | --- |
+| `submissions/phase2_v1_baseline.csv` | Phase 2 v1 (LightGBM) output. |
+| `submissions/pytorch_embeddings_v1.csv` | Phase 2 v2 (PyTorch + Embeddings) output. |
 
 ## Typical Phase 2 workflow
 
@@ -322,38 +333,23 @@ has the durable rules.
 # 0. (Once) Phase 1 fine-tuned checkpoint must exist:
 ls runs/phase4_v1_h200/checkpoints/best.pt
 
-# 1. Bulk segmentation of all 70 Phase 2 FOVs (~17 min on L40S):
-sbatch run_segment_all_phase2.sh
-# → cache/masks_phase2/{FOV_101..FOV_160,FOV_E..FOV_N}.npy + cell_counts.csv
+# --- OPTION A: RUN FULL PIPELINE (Recommended for v2) ---
+# This script handles segmentation, embedding extraction, data building,
+# training, and inference in one job. Use --overwrite to force update.
+sbatch run_phase2_full_pipeline.sh --overwrite
 
-# 2. Build per-cell expression matrices + consolidated train set (~3.5 min CPU):
+# --- OPTION B: STEP-BY-STEP (Phases 2.2 - 2.4) ---
+# 1. Bulk segmentation + deep embeddings (~17 min on L40S):
+sbatch run_segment_all_phase2.sh --overwrite
+
+# 2. Build expression matrices + consolidate training data (~3.5 min):
 python3 scripts/phase2/build_expression.py
-# → cache/gene_vocab.json
-# → cache/expression_phase2/<FOV>.npz × 70
-# → cache/phase2_train.npz
 
-# 3. Train classifier (~6 min CPU at subclass level):
-python3 scripts/phase2/train_classifier.py --label_level subclass_label
-# → runs/phase2_baseline/
+# 3. Train classifier (PyTorch MLP):
+python3 scripts/phase2/train_classifier.py --run_dir runs/phase2_pytorch
 
-# 4. Validate on the 10 val FOVs (~30 s):
-VAL_FOVS=$(cat phase2_val_fovs.txt | tr '\n' ' ')
+# 4. Generate Kaggle submission:
 python3 scripts/phase2/predict.py \
-    --run_dir runs/phase2_baseline \
-    --fovs $VAL_FOVS \
-    --spots_csv /scratch/pl2820/data/competition_phase2/train/ground_truth/spots_train.csv \
-    --output runs/phase2_baseline/val_submission.csv \
-    --no_sample_align
-python3 scripts/phase2/local_eval_phase2.py \
-    --predicted runs/phase2_baseline/val_submission.csv
-
-# 5. Generate Kaggle submission (10 test FOVs, ~10 s):
-python3 scripts/phase2/predict.py \
-    --run_dir runs/phase2_baseline \
-    --output submissions/phase2_v1_baseline.csv
-
-# 6. Submit to Kaggle (or via the web UI):
-kaggle competitions submit -c <competition-name> \
-    -f submissions/phase2_v1_baseline.csv \
-    -m "Phase 2 v1 baseline: subclass LightGBM, local 0.555 / Kaggle 0.61"
+    --run_dir runs/phase2_pytorch \
+    --output submissions/pytorch_embeddings_v1.csv
 ```
