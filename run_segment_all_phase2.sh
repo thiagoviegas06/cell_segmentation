@@ -10,7 +10,7 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-type=END
-#SBATCH --mail-user=tjv235@nyu.edu
+#SBATCH --mail-user=dr3432@nyu.edu
 
 # Phase 2.2 — bulk 3D-stitched segmentation of all 70 Phase 2 FOVs
 # (60 train + 10 test) using the Phase 1 fine-tuned cpsam checkpoint.
@@ -40,9 +40,9 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/scratch/tjv235/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt}"
 DATA_ROOT="${DATA_ROOT:-/scratch/pl2820/data/competition_phase2}"
-OUTPUT_DIR="${OUTPUT_DIR:-/scratch/tjv235/cell_segmentation/cache/masks_phase2}"
+OUTPUT_DIR="${OUTPUT_DIR:-/scratch/dr3432/cell_segmentation/cache/masks_phase2}"
 STITCH_THRESHOLD="${STITCH_THRESHOLD:-0.3}"
 DIAMETER="${DIAMETER:-}"
 
@@ -53,8 +53,8 @@ if [[ -n "$DIAMETER" ]]; then
   fi
 fi
 
-SIF="/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif"
-OVL="/scratch/tjv235/neuro.ext3"
+SIF="/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif"
+OVL="/scratch/dr3432/pytorch/pytorch_env.ext3"
 
 export PRETRAINED_MODEL DATA_ROOT OUTPUT_DIR STITCH_THRESHOLD DIAM_FLAG
 
@@ -66,7 +66,7 @@ set -euo pipefail
 source /ext3/env.sh
 conda activate my_writable_env
 
-cd /scratch/tjv235/cell_segmentation
+cd /scratch/dr3432/cell_segmentation
 python -u scripts/phase2/segment_all.py \
     --pretrained_model  "$PRETRAINED_MODEL" \
     --data_root         "$DATA_ROOT" \

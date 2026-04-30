@@ -48,15 +48,15 @@ gitignored and must be rebuilt locally.
   `/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif` plus an
   overlay containing the `my_writable_env` conda env (with `cellpose`,
   `h5py`, `cv2`, `pandas`, `numpy`, `pyarrow`). The original author's overlay
-  lives at `/scratch/tjv235/neuro.ext3`; either ask to share it, build your
+  lives at `/scratch/dr3432/neuro.ext3`; either ask to share it, build your
   own, or run the python scripts directly in any equivalent env (the
   launchers are SLURM convenience wrappers — none of the logic is in them).
 
 ### 2. Update hardcoded paths
-Several scripts and SLURM launchers bake `/scratch/tjv235/cell_segmentation/`
-and `/scratch/tjv235/neuro.ext3` into their defaults. After cloning, do a
+Several scripts and SLURM launchers bake `/scratch/dr3432/cell_segmentation/`
+and `/scratch/dr3432/neuro.ext3` into their defaults. After cloning, do a
 project-wide search-and-replace of
-`/scratch/tjv235/cell_segmentation` → your own checkout root, and update
+`/scratch/dr3432/cell_segmentation` → your own checkout root, and update
 `OVL=...` in each `run_*.sh` to your overlay path. Files that need
 attention:
 
@@ -250,13 +250,13 @@ RUN_NAME=phase4_v1 sbatch --gres=gpu:h200:1 --time=24:00:00 run_train_cellpose.s
 sbatch run_local_eval.sh \
     --run_name phase4_v1_rerun \
     --segmenter scripts.segmenters:build_cellpose_finetuned \
-    --segmenter_kwargs "pretrained_model=/scratch/tjv235/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
+    --segmenter_kwargs "pretrained_model=/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
 
 # Phase 5 local eval (3D-stitched + per-spot z lookup):
 sbatch run_local_eval.sh \
     --run_name phase5_v1_eval \
     --segmenter scripts.segmenters:build_cellpose_finetuned_3d \
-    --segmenter_kwargs "pretrained_model=/scratch/tjv235/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
+    --segmenter_kwargs "pretrained_model=/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
 
 # Test-set submissions:
 sbatch run_infer_test.sh                   # Phase 4, single z (LB 0.76)
@@ -279,7 +279,7 @@ classifier and evaluation stack on top.
 Phase 2 data lives at `/scratch/pl2820/data/competition_phase2/` (60
 train FOVs `FOV_101..FOV_160` + the 10 test FOVs). Strategy and
 findings live in `handoff.md` (gitignored — session-state only). Memory
-file at `~/.claude/projects/-scratch-tjv235-cell-segmentation/memory/project_merfish_segmentation.md`
+file at `~/.claude/projects/-scratch-dr3432-cell-segmentation/memory/project_merfish_segmentation.md`
 has the durable rules.
 
 ## Phase 2 — at a glance
