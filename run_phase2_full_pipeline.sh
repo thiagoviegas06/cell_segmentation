@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=phase2_full_pipeline
-#SBATCH --account=torch_pr_60_tandon_priority
+#SBATCH --account=torch_pr_173_general
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -9,8 +9,8 @@
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --mail-type=END
-#SBATCH --mail-user=$USER@nyu.edu
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=dr3432@nyu.edu
 
 # Phase 2 End-to-End Pipeline:
 # 1. Segmentation + Deep Embedding Extraction (ROI Pooling)
