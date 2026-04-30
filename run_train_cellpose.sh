@@ -4,13 +4,13 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=48:00:00
-#SBATCH --mem=64GB
+#SBATCH --time=20:00:00
+#SBATCH --mem=128GB
 #SBATCH --gres=gpu:h200:1
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --mail-type=END
-#SBATCH --mail-user=$USER@nyu.edu
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=dr3432@nyu.edu
 
 # Phase 4: fine-tune cpsam on Phase 3 training data, then eval on Phase 1 val FOVs.
 #
