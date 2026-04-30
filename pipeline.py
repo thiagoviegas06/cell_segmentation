@@ -355,9 +355,10 @@ if __name__ == "__main__":
         default="/scratch/pl2820/data/competition/test_spots.csv",
         help="Path to test_spots.csv",
     )
+    user = os.environ.get("USER", "dr3432")
     parser.add_argument(
         "--output",
-        default="/scratch/dr3432/cell_segmentation/submission.csv",
+        default=f"/scratch/{user}/cell_segmentation/submission.csv",
         help="Output path for submission.csv",
     )
     parser.add_argument(

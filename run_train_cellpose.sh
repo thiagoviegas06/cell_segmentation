@@ -10,7 +10,7 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-type=END
-#SBATCH --mail-user=dr3432@nyu.edu
+#SBATCH --mail-user=$USER@nyu.edu
 
 # Phase 4: fine-tune cpsam on Phase 3 training data, then eval on Phase 1 val FOVs.
 #
@@ -53,8 +53,8 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 SIF="/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif"
-OVL="/scratch/dr3432/pytorch/pytorch_env.ext3"
-PROJECT="/scratch/dr3432/cell_segmentation"
+OVL="/scratch/$USER/pytorch/pytorch_env.ext3"
+PROJECT="/scratch/$USER/cell_segmentation"
 
 RUN_NAME="${RUN_NAME:-phase4_$(date +%Y%m%d_%H%M%S)}"
 EVAL_DIAMETER="${EVAL_DIAMETER:--1}"
@@ -73,7 +73,7 @@ source /ext3/env.sh
 RUN_NAME="$1"; shift
 EVAL_DIAMETER="$1"; shift
 
-cd /scratch/dr3432/cell_segmentation
+cd /scratch/$USER/cell_segmentation
 
 # 1) Train
 python -u scripts/train_cellpose.py \

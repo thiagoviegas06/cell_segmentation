@@ -53,27 +53,22 @@ gitignored and must be rebuilt locally.
   own, or run the python scripts directly in any equivalent env (the
   launchers are SLURM convenience wrappers — none of the logic is in them).
 
-### 2. Update hardcoded paths
-Several scripts and SLURM launchers bake `/scratch/dr3432/cell_segmentation/`
-and `/scratch/dr3432/neuro.ext3` into their defaults. After cloning, do a
-project-wide search-and-replace of
-`/scratch/dr3432/cell_segmentation` → your own checkout root, and update
-`OVL=...` in each `run_*.sh` to your overlay path. Files that need
-attention:
+### 2. Paths and Environment
+The scripts and SLURM launchers are designed to be portable across different
+user accounts on the HPC cluster. They utilize the `$USER` environment
+variable (in bash) or `os.environ.get("USER")` (in Python) to construct
+default paths under `/scratch/$USER/cell_segmentation/`.
 
-| File | What to change |
-| --- | --- |
-| `run_local_eval.sh`, `run_train_cellpose.sh`, `run_infer_test.sh`, `run_infer_test_v2.sh`, `run_pipeline.sh` | `PROJECT=`, `OVL=`, the `cd ...` line, and (for the test-set launchers) `PRETRAINED_MODEL`, `OUTPUT` env-var defaults |
-| `scripts/local_eval.py` | `--val_fovs`, `--gt_labels`, `--runs_dir` defaults |
-| `scripts/build_gt_labels.py` | `--output` default |
-| `scripts/prep_training_data.py` | `--val_fovs`, `--out_dir` defaults |
-| `scripts/train_cellpose.py` | `--data_dir`, `--runs_dir` defaults |
-| `scripts/compute_diameter.py`, `scripts/make_val_split.py` | `--output` defaults (only matters if you re-run them — outputs are committed) |
-| `pipeline.py` | `--output` default |
+By default, the SLURM launchers (`run_*.sh`) expect:
+- Your project root to be at `/scratch/$USER/cell_segmentation/`
+- Your Singularity overlay to be at `/scratch/$USER/pytorch/pytorch_env.ext3`
 
-You can also bypass the defaults by passing explicit `--output`/`--gt_labels`/
-`--val_fovs`/etc. flags on every invocation; the search-and-replace is
-strictly less error-prone.
+If your setup differs, you can override these paths by setting environment
+variables or passing command-line arguments to the scripts. For example:
+```bash
+# Override overlay path for a single run
+OVL="/path/to/your/env.ext3" sbatch run_local_eval.sh
+```
 
 ### 3. Rebuild gitignored artifacts
 What's committed: source, `val_fovs.txt`, `reference/diameter_px.txt`.

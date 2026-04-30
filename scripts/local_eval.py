@@ -30,6 +30,7 @@ import argparse
 import importlib
 import json
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -118,11 +119,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--segmenter", required=True,
                     help="Factory spec: 'module.path:factory_name'")
-    ap.add_argument("--val_fovs", default="/scratch/dr3432/cell_segmentation/val_fovs.txt")
+    user = os.environ.get("USER", "dr3432")
+    ap.add_argument("--val_fovs", default=f"/scratch/{user}/cell_segmentation/val_fovs.txt")
     ap.add_argument("--data_root", default="/scratch/pl2820/data/competition")
     ap.add_argument("--gt_labels",
-                    default="/scratch/dr3432/cell_segmentation/cache/gt_spot_labels.parquet")
-    ap.add_argument("--runs_dir", default="/scratch/dr3432/cell_segmentation/runs")
+                    default=f"/scratch/{user}/cell_segmentation/cache/gt_spot_labels.parquet")
+    ap.add_argument("--runs_dir", default=f"/scratch/{user}/cell_segmentation/runs")
     ap.add_argument("--run_name", default=None,
                     help="Override run directory name (default: timestamp)")
     ap.add_argument("--gpu", action="store_true",

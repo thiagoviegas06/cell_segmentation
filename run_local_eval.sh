@@ -10,7 +10,7 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-type=END
-#SBATCH --mail-user=dr3432@nyu.edu
+#SBATCH --mail-user=$USER@nyu.edu
 
 # Usage:
 #   sbatch run_local_eval.sh                      # defaults: zero-shot cpsam, auto diameter
@@ -29,8 +29,8 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 SIF="/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif"
-OVL="/scratch/dr3432/pytorch/pytorch_env.ext3"
-PROJECT="/scratch/dr3432/cell_segmentation"
+OVL="/scratch/$USER/pytorch/pytorch_env.ext3"
+PROJECT="/scratch/$USER/cell_segmentation"
 
 singularity exec --nv \
   --overlay "$OVL":ro \
@@ -39,7 +39,7 @@ singularity exec --nv \
 set -euo pipefail
 source /ext3/env.sh
 
-cd /scratch/dr3432/cell_segmentation
+cd /scratch/$USER/cell_segmentation
 python -u scripts/local_eval.py \
     --segmenter scripts.segmenters:build_cellpose_zeroshot \
     --gpu \

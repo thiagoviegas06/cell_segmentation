@@ -10,7 +10,7 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-type=END
-#SBATCH --mail-user=dr3432@nyu.edu
+#SBATCH --mail-user=$USER@nyu.edu
 
 # Phase 5 test-set inference: 3D-stitched cellpose + per-spot z lookup.
 #
@@ -39,8 +39,8 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt}"
-OUTPUT="${OUTPUT:-/scratch/dr3432/cell_segmentation/submissions/phase5_v1_h200_submission.csv}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/scratch/$USER/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt}"
+OUTPUT="${OUTPUT:-/scratch/$USER/cell_segmentation/submissions/phase5_v1_h200_submission.csv}"
 DIAMETER="${DIAMETER:-}"
 STITCH_THRESHOLD="${STITCH_THRESHOLD:-0.3}"
 
@@ -52,7 +52,7 @@ if [[ -n "$DIAMETER" ]]; then
 fi
 
 SIF="/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif"
-OVL="/scratch/dr3432/pytorch/pytorch_env.ext3"
+OVL="/scratch/$USER/pytorch/pytorch_env.ext3"
 
 export PRETRAINED_MODEL OUTPUT DIAM_FLAG STITCH_THRESHOLD
 
@@ -63,7 +63,7 @@ singularity exec --nv \
 set -euo pipefail
 source /ext3/env.sh
 
-cd /scratch/dr3432/cell_segmentation
+cd /scratch/$USER/cell_segmentation
 python -u scripts/pipeline_v2.py \
     --pretrained_model  "$PRETRAINED_MODEL" \
     --output            "$OUTPUT" \

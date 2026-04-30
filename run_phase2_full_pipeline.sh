@@ -10,7 +10,7 @@
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --mail-type=END
-#SBATCH --mail-user=dr3432@nyu.edu
+#SBATCH --mail-user=$USER@nyu.edu
 
 # Phase 2 End-to-End Pipeline:
 # 1. Segmentation + Deep Embedding Extraction (ROI Pooling)
@@ -31,14 +31,14 @@ export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 # Configurable paths (defaults match the existing scripts)
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt}"
+PRETRAINED_MODEL="${PRETRAINED_MODEL:-/scratch/$USER/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt}"
 DATA_ROOT="${DATA_ROOT:-/scratch/pl2820/data/competition_phase2}"
-OUTPUT_DIR="${OUTPUT_DIR:-/scratch/dr3432/cell_segmentation/cache/masks_phase2}"
+OUTPUT_DIR="${OUTPUT_DIR:-/scratch/$USER/cell_segmentation/cache/masks_phase2}"
 RUN_DIR="runs/phase2_pytorch"
 SUBMISSION_PATH="submissions/pytorch_embeddings_v1.csv"
 
 SIF="/share/apps/images/cuda12.8.1-cudnn9.8.0-ubuntu24.04.2.sif"
-OVL="/scratch/dr3432/pytorch/pytorch_env.ext3"
+OVL="/scratch/$USER/pytorch/pytorch_env.ext3"
 
 echo "Starting full Phase 2 pipeline..."
 echo "  Pretrained Model: $PRETRAINED_MODEL"
@@ -53,7 +53,7 @@ set -euo pipefail
 source /ext3/env.sh
 conda activate my_writable_env
 
-cd /scratch/dr3432/cell_segmentation
+cd /scratch/$USER/cell_segmentation
 
 echo "--- Step 1: Segmentation & Embedding Extraction ---"
 python -u scripts/phase2/segment_all.py \

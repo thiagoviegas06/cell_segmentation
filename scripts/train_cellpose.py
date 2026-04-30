@@ -39,6 +39,7 @@ Alignment notes:
 import argparse
 import json
 import logging
+import os
 import re
 import shutil
 import sys
@@ -113,11 +114,12 @@ def load_fov(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
 
 def main():
     ap = argparse.ArgumentParser()
+    user = os.environ.get("USER", "dr3432")
     ap.add_argument(
         "--training_data",
-        default="/scratch/dr3432/cell_segmentation/training_data",
+        default=f"/scratch/{user}/cell_segmentation/training_data",
     )
-    ap.add_argument("--runs_dir", default="/scratch/dr3432/cell_segmentation/runs")
+    ap.add_argument("--runs_dir", default=f"/scratch/{user}/cell_segmentation/runs")
     ap.add_argument("--run_name", default=None,
                     help="Subdir under runs/ (default: phase4_<timestamp>)")
     ap.add_argument("--model_name", default="finetuned",

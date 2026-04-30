@@ -32,6 +32,7 @@ FOV, not one per z-plane).
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -109,13 +110,14 @@ def render_qc_overlay(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default="/scratch/pl2820/data/competition")
+    user = os.environ.get("USER", "dr3432")
     ap.add_argument(
         "--val_fovs",
-        default="/scratch/dr3432/cell_segmentation/val_fovs.txt",
+        default=f"/scratch/{user}/cell_segmentation/val_fovs.txt",
     )
     ap.add_argument(
         "--out_dir",
-        default="/scratch/dr3432/cell_segmentation/training_data",
+        default=f"/scratch/{user}/cell_segmentation/training_data",
     )
     ap.add_argument(
         "--qc_count", type=int, default=4,

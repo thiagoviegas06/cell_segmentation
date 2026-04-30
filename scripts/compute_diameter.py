@@ -20,6 +20,7 @@ prints the full distribution summary.
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -81,9 +82,10 @@ def main():
     )
     ap.add_argument("--z", type=int, default=2,
                     help="z-plane whose polygon sets each cell's diameter (default: 2)")
+    user = os.environ.get("USER", "dr3432")
     ap.add_argument(
-        "--out",
-        default="/scratch/dr3432/cell_segmentation/reference/diameter_px.txt",
+        "--output",
+        default=f"/scratch/{user}/cell_segmentation/reference/diameter_px.txt",
     )
     ap.add_argument("--all_z", action="store_true",
                     help="Also print per-z summaries for context.")
