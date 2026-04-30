@@ -10,7 +10,7 @@ Phase 5 test-set scaffolding was added:
     was already uploaded to Kaggle and scored 0.76 on the public LB.
   * Phase 5 test-set scaffolding now exists (scripts/pipeline_v2.py +
     run_infer_test_v2.sh); sbatch is pending user kick-off.)
-Working dir: /scratch/dr3432/cell_segmentation/
+Working dir: /scratch/tjv235/cell_segmentation/
 Competition data: /scratch/pl2820/data/competition/
 
 Goal
@@ -445,7 +445,7 @@ Phase 5 v1 local eval results (runs/phase5_v1_eval/ — job 6697654)
     sbatch run_local_eval.sh \
       --segmenter scripts.segmenters:build_cellpose_finetuned_3d \
       --diameter -1 \
-      --segmenter_kwargs "pretrained_model=/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt" \
+      --segmenter_kwargs "pretrained_model=/scratch/tjv235/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt" \
       --run_name phase5_v1_eval
   (Note: run_local_eval.sh's embedded --segmenter build_cellpose_zeroshot
   default is overridden by the CLI --segmenter above — argparse takes
@@ -570,7 +570,7 @@ Local 6-FOV val ARI for cross-reference:
 
 Directory Layout Snapshot
 -------------------------
-/scratch/dr3432/cell_segmentation/
+/scratch/tjv235/cell_segmentation/
 |- pipeline.py             (UNMODIFIED — as required)
 |- run_pipeline.sh         (UNMODIFIED — existing zero-shot test-set runner)
 |- submission.csv          (pre-existing 0.62 output — DO NOT OVERWRITE)

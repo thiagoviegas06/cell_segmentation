@@ -1,11 +1,28 @@
-# MERFISH Cell Segmentation
+# MERFISH Cell Segmentation + Classification
 
-Working directory for the MERFISH cell-segmentation Kaggle task. The original
-end-to-end pipeline (`pipeline.py`) produces a zero-shot `submission.csv` for
-the public leaderboard; everything under `scripts/`, `cache/`, `runs/`, and
-`submissions/` is the local validator + fine-tune + 3D-stitched inference
-stack built on top to improve the segmentation and re-score it offline against
-a held-out subset of training FOVs using the organizer's official ARI metric.
+Working directory for the two-phase MERFISH Kaggle task:
+
+- **Competition Phase 1 — segmentation.** Cluster spots into cells. Solved
+  by a fine-tuned cpsam + 3D-stitched inference stack; final Kaggle LB
+  **0.83** (see "Phase 1 — segmentation: pipeline at a glance" below).
+- **Competition Phase 2 — cell-type classification.** Predict 4-level
+  Allen Brain Cell Atlas labels per spot (class / subclass / supertype /
+  cluster) using the Phase 1 segmentation as a fixed input. Subclass
+  LightGBM baseline currently **0.61 LB** (see "Phase 2 — cell-type
+  classification" near the bottom).
+
+The original end-to-end Phase 1 pipeline (`pipeline.py`) produces a
+zero-shot `submission.csv` for the public leaderboard; everything under
+`scripts/`, `cache/`, `runs/`, and `submissions/` is the local validator,
+fine-tune, 3D-stitched inference, plus the Phase 2 classifier built on
+top to improve the score and re-score it offline against held-out FOVs
+using the organizer's official ARI metric.
+
+Note on naming: rows in the Phase 1 table below are labeled
+"Phase 1 / Phase 2 / Phase 3 / …" — those refer to **segmentation
+iteration steps**, not the competition phases. To avoid confusion, the
+cell-type-classification work is always referred to as
+"Phase 2 (cell-type classification)" in this README.
 
 See `summary.txt` for the running phase-by-phase narrative (findings,
 verification, results, outstanding work). This README is a per-file map of
@@ -15,16 +32,105 @@ given piece.
 Competition data lives outside this tree at
 `/scratch/pl2820/data/competition/`.
 
-## Pipeline at a glance
+## First-time setup (replicate from a fresh clone)
 
-| Phase | What it does | Primary files | Kaggle LB | Local 6-FOV ARI |
+If you're cloning this repo into your own `/scratch/<netid>/cell_segmentation/`,
+follow these four steps before running any phase. Skipping step 3 is what
+causes the common error
+`FileNotFoundError: ...cache/gt_spot_labels.parquet` — that file is
+gitignored and must be rebuilt locally.
+
+### 1. Prerequisites
+- **Competition data** — read access to the shared tree at
+  `/scratch/pl2820/data/competition/` (no copy needed; everything points at
+  it directly).
+- **Singularity image + conda env** — the launchers expect
+  `/share/apps/images/cuda12.1.1-cudnn8.9.0-devel-ubuntu22.04.2.sif` plus an
+  overlay containing the `my_writable_env` conda env (with `cellpose`,
+  `h5py`, `cv2`, `pandas`, `numpy`, `pyarrow`). The original author's overlay
+  lives at `/scratch/tjv235/neuro.ext3`; either ask to share it, build your
+  own, or run the python scripts directly in any equivalent env (the
+  launchers are SLURM convenience wrappers — none of the logic is in them).
+
+### 2. Update hardcoded paths
+Several scripts and SLURM launchers bake `/scratch/tjv235/cell_segmentation/`
+and `/scratch/tjv235/neuro.ext3` into their defaults. After cloning, do a
+project-wide search-and-replace of
+`/scratch/tjv235/cell_segmentation` → your own checkout root, and update
+`OVL=...` in each `run_*.sh` to your overlay path. Files that need
+attention:
+
+| File | What to change |
+| --- | --- |
+| `run_local_eval.sh`, `run_train_cellpose.sh`, `run_infer_test.sh`, `run_infer_test_v2.sh`, `run_pipeline.sh` | `PROJECT=`, `OVL=`, the `cd ...` line, and (for the test-set launchers) `PRETRAINED_MODEL`, `OUTPUT` env-var defaults |
+| `scripts/local_eval.py` | `--val_fovs`, `--gt_labels`, `--runs_dir` defaults |
+| `scripts/build_gt_labels.py` | `--output` default |
+| `scripts/prep_training_data.py` | `--val_fovs`, `--out_dir` defaults |
+| `scripts/train_cellpose.py` | `--data_dir`, `--runs_dir` defaults |
+| `scripts/compute_diameter.py`, `scripts/make_val_split.py` | `--output` defaults (only matters if you re-run them — outputs are committed) |
+| `pipeline.py` | `--output` default |
+
+You can also bypass the defaults by passing explicit `--output`/`--gt_labels`/
+`--val_fovs`/etc. flags on every invocation; the search-and-replace is
+strictly less error-prone.
+
+### 3. Rebuild gitignored artifacts
+What's committed: source, `val_fovs.txt`, `reference/diameter_px.txt`.
+What's NOT committed and must be regenerated locally:
+`cache/`, `training_data/`, `runs/`, `submissions/`, `submission.csv`,
+`logs/`.
+
+Run from the repo root after step 2. Steps 3a is required for *any* local
+eval; 3b is only needed if you're going to fine-tune; 3c is a way to skip
+fine-tuning by reusing the trained checkpoint.
+
+```bash
+# 3a. GT spot labels — REQUIRED for local_eval (~17 s, ~13 MB).
+mkdir -p cache
+python scripts/build_gt_labels.py     # writes cache/gt_spot_labels.parquet
+
+# 3b. Multi-z fine-tuning inputs — only for Phase 3+ training (~5 min, ~11 GB).
+mkdir -p training_data
+python scripts/prep_training_data.py  # writes training_data/FOV_*_z{0..4}.npz
+
+# 3c. (Optional) skip fine-tuning by copying the trained checkpoint.
+#     The Phase 4 weights aren't in git; ask a teammate to share
+#     runs/phase4_v1_h200/checkpoints/best.pt (~few hundred MB) and place it
+#     at the same relative path in your checkout. Both Phase 4 and Phase 5
+#     test-set inference and 6-FOV eval can run from this single checkpoint.
+mkdir -p runs/phase4_v1_h200/checkpoints
+# scp <teammate>:/scratch/<their-netid>/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt \
+#     runs/phase4_v1_h200/checkpoints/best.pt
+```
+
+### 4. Sanity-check the install
+This reproduces the Phase 1 zero-shot baseline (mean ARI **0.4765** on the
+6-FOV val split, ~5 min on an H100):
+
+```bash
+sbatch run_local_eval.sh --run_name sanity_zeroshot
+# When done:
+cat runs/sanity_zeroshot/summary.json     # expect mean_ari ≈ 0.4765
+column -s, -t runs/sanity_zeroshot/per_fov.csv | less -S
+```
+
+If that matches, you're set up correctly. From here see **Typical workflow**
+at the bottom of this README for the per-phase commands.
+
+## Phase 1 — segmentation: pipeline at a glance
+
+These rows are sequential **iteration steps** of the segmentation work
+(competition Phase 1). For the Allen-taxonomy classifier (competition
+Phase 2), see further down.
+
+| Step | What it does | Primary files | Kaggle LB | Local 6-FOV ARI |
 | --- | --- | --- | --- | --- |
 | Baseline | Zero-shot cpsam, single z-plane | `pipeline.py`, `run_pipeline.sh` | 0.62 | 0.4765 |
 | Phase 1 | Local validator + committed 6-FOV val split | `scripts/local_eval.py`, `val_fovs.txt` | — | 0.4765 |
 | Phase 2 | Diameter calibration + sweep | `scripts/compute_diameter.py` | — | 0.4608 (best, 1.1× auto) |
 | Phase 3 | Multi-z fine-tune data prep (170 `.npz`) | `scripts/prep_training_data.py` | — | — |
 | Phase 4 | Fine-tune cpsam → test-set inference (z=2 only) | `scripts/train_cellpose.py`, `scripts/infer_test.py`, `run_infer_test.sh` | 0.76 | 0.6847 |
-| Phase 5 | 3D-stitched inference, per-spot z lookup | `scripts/pipeline_v2.py`, `build_cellpose_finetuned_3d` factory, `run_infer_test_v2.sh` | pending | 0.7544 |
+| Phase 5 | 3D-stitched inference, per-spot z lookup | `scripts/pipeline_v2.py`, `build_cellpose_finetuned_3d` factory, `run_infer_test_v2.sh` | **0.83** | 0.7544 |
 
 ## Top level
 
@@ -37,8 +143,10 @@ Competition data lives outside this tree at
 | `run_infer_test.sh` | Phase 4 test-set inference launcher (L40S, 1 h). Wraps `scripts/infer_test.py` — single-z inference with a fine-tuned checkpoint. Env vars: `PRETRAINED_MODEL`, `OUTPUT`, `DIAMETER`. |
 | `run_infer_test_v2.sh` | Phase 5 test-set inference launcher (L40S, 1 h). Wraps `scripts/pipeline_v2.py` — 3D-stitched inference with per-spot z lookup. Env vars: `PRETRAINED_MODEL`, `OUTPUT`, `DIAMETER`, `STITCH_THRESHOLD` (default 0.3). Extra CLI args are forwarded (e.g. `--fovs FOV_A` for single-FOV debugging). |
 | `submission.csv` | Pre-existing zero-shot cpsam output used for the 0.62 Kaggle baseline. Kept for reference; do not overwrite. |
-| `summary.txt` | Running notes across all phases: data-structure findings, verification steps, deliverables, and the outstanding work queue. Read this first for project context. |
-| `val_fovs.txt` | Committed 6-FOV validation split (stratified across cell-density range). Consumed by `local_eval.py` via `--val_fovs`. Distinct from `train_cellpose.py`'s in-training val split so the Phase 1 split stays clean for final ARI eval. |
+| `summary.txt` | Running notes across all Phase 1 segmentation steps: data-structure findings, verification steps, deliverables, and the outstanding work queue. Read this first for Phase 1 context. |
+| `val_fovs.txt` | Committed 6-FOV validation split for the Phase 1 segmentation work (stratified across cell-density range). Consumed by `local_eval.py` via `--val_fovs`. Distinct from the Phase 2 split (`phase2_val_fovs.txt`) and from `train_cellpose.py`'s in-training val split. |
+| `phase2_val_fovs.txt` | Committed 10-FOV validation split for **Phase 2 (cell-type classification)**, stratified by cell count from `cache/masks_phase2/cell_counts.csv`. Excludes FOV_147 (kept in train because it holds 100% of `29 CB Glut` cells). Consumed by `scripts/phase2/train_classifier.py` and `scripts/phase2/local_eval_phase2.py`. |
+| `run_segment_all_phase2.sh` | SLURM launcher (1×L40S, 2 h) for `scripts/phase2/segment_all.py` — bulk 3D-stitched segmentation of all 70 Phase 2 FOVs (60 train + 10 test). Env vars: `PRETRAINED_MODEL`, `DATA_ROOT`, `OUTPUT_DIR`, `STITCH_THRESHOLD`, `DIAMETER`. Forwards extra args (e.g. `--fovs FOV_E` for a smoke test). |
 | `run.log` | Log from an early pipeline run, kept only for reference. |
 
 ## `scripts/`
@@ -93,12 +201,14 @@ Training runs contain `config.json` (hyperparams + val_fovs + train/val image co
 
 ## `submissions/`
 
-Kaggle-format outputs written by `infer_test.py` / `pipeline_v2.py` (directory is gitignored).
+Kaggle-format outputs written by `infer_test.py` / `pipeline_v2.py` /
+`scripts/phase2/predict.py` (directory is gitignored).
 
 | File | Produced by | Kaggle LB |
 | --- | --- | --- |
 | `phase4_v1_h200_submission.csv` | `run_infer_test.sh` on `phase4_v1_h200/checkpoints/best.pt` | 0.76 |
-| `phase5_v1_h200_submission.csv` | `run_infer_test_v2.sh` on same checkpoint, 3D-stitched path | pending |
+| `phase5_v1_h200_submission.csv` | `run_infer_test_v2.sh` on same checkpoint, 3D-stitched path | **0.83** |
+| `phase2_v1_baseline.csv` | `scripts/phase2/predict.py` on `runs/phase2_baseline/` (subclass LightGBM, hierarchy rollout) | **0.61** |
 
 ## `logs/`
 
@@ -115,12 +225,17 @@ Safe to prune.
 
 ## Typical workflow
 
+> If you're running this repo for the first time, do **First-time setup**
+> above first — `cache/`, `training_data/`, and `runs/` are all gitignored
+> and must be regenerated before any of the commands below will work.
+
 ```bash
-# One-time setup (already done):
-python scripts/build_gt_labels.py          # cache/gt_spot_labels.parquet
-python scripts/make_val_split.py           # val_fovs.txt
-python scripts/compute_diameter.py         # reference/diameter_px.txt
-python scripts/prep_training_data.py       # training_data/FOV_*_z{0..4}.npz
+# One-time setup (see "First-time setup" above for details and path overrides):
+python scripts/build_gt_labels.py          # cache/gt_spot_labels.parquet (REQUIRED)
+python scripts/prep_training_data.py       # training_data/FOV_*_z{0..4}.npz (only for Phase 3+)
+# val_fovs.txt and reference/diameter_px.txt are committed; only re-run if changing them:
+# python scripts/make_val_split.py
+# python scripts/compute_diameter.py
 
 # Zero-shot / diameter-swept eval (Phases 1–2):
 sbatch run_local_eval.sh --run_name phase1_baseline_zeroshot
@@ -135,13 +250,13 @@ RUN_NAME=phase4_v1 sbatch --gres=gpu:h200:1 --time=24:00:00 run_train_cellpose.s
 sbatch run_local_eval.sh \
     --run_name phase4_v1_rerun \
     --segmenter scripts.segmenters:build_cellpose_finetuned \
-    --segmenter_kwargs "pretrained_model=/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
+    --segmenter_kwargs "pretrained_model=/scratch/tjv235/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
 
 # Phase 5 local eval (3D-stitched + per-spot z lookup):
 sbatch run_local_eval.sh \
     --run_name phase5_v1_eval \
     --segmenter scripts.segmenters:build_cellpose_finetuned_3d \
-    --segmenter_kwargs "pretrained_model=/scratch/dr3432/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
+    --segmenter_kwargs "pretrained_model=/scratch/tjv235/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt"
 
 # Test-set submissions:
 sbatch run_infer_test.sh                   # Phase 4, single z (LB 0.76)
@@ -150,4 +265,95 @@ sbatch run_infer_test_v2.sh                # Phase 5, 3D stitched (LB pending)
 # Inspect results:
 cat runs/<name>/summary.json
 column -s, -t runs/<name>/per_fov.csv | less -S
+```
+
+# Phase 2 — cell-type classification (Allen taxonomy)
+
+Different competition task on a different test set. Predict 4-level Allen
+Brain Cell Atlas labels (`class`, `subclass`, `supertype`, `cluster`)
+per spot for **10 test FOVs `FOV_E..FOV_N`** (~439K spots, ~83% of
+which are background per the GT). Metric: mean ARI over 40 (FOV, level)
+pairs. Phase 1 segmentation is reused as-is — the Phase 2 work is the
+classifier and evaluation stack on top.
+
+Phase 2 data lives at `/scratch/pl2820/data/competition_phase2/` (60
+train FOVs `FOV_101..FOV_160` + the 10 test FOVs). Strategy and
+findings live in `handoff.md` (gitignored — session-state only). Memory
+file at `~/.claude/projects/-scratch-tjv235-cell-segmentation/memory/project_merfish_segmentation.md`
+has the durable rules.
+
+## Phase 2 — at a glance
+
+| Sub-phase | What it does | Primary files | Kaggle LB | Local val (mean ARI) |
+| --- | --- | --- | --- | --- |
+| 2.1 | Data discovery (schemas, gene panels, label hierarchy, normalization) | (offline analysis only) | — | — |
+| 2.2 | Re-segment all 70 Phase 2 FOVs with the Phase 1 fine-tuned model | `scripts/phase2/segment_all.py`, `run_segment_all_phase2.sh` | — | n/a (segmentation step) |
+| 2.3 | Per-cell gene-expression vectors + GT centroid matching | `scripts/phase2/build_expression.py` | — | 76% match rate |
+| 2.4 v1 | LightGBM subclass classifier + deterministic hierarchy rollout | `scripts/phase2/{train_classifier,predict,local_eval_phase2}.py` | **0.61** | 0.5554 |
+
+## `scripts/phase2/`
+
+| File | Purpose |
+| --- | --- |
+| `segment_all.py` | 3D-stitched cellpose inference over all 70 Phase 2 FOVs using the Phase 1 fine-tuned checkpoint (`runs/phase4_v1_h200/checkpoints/best.pt`). Same `model.eval(stitch_threshold=0.3, channel_axis=-1, z_axis=0, do_3D=False, normalize=False)` as `pipeline_v2.py`. Saves uint16 `(5, 2048, 2048)` masks to `cache/masks_phase2/<FOV>.npy` plus a `cell_counts.csv`. Resumes (skips already-saved FOVs) unless `--overwrite`. |
+| `build_expression.py` | For each FOV, builds a `(n_cells, 1147)` int32 gene-count matrix by per-spot mask lookup. Drops `blank-*` decoys. Computes per-cell `(image_row, image_col)` centroids via scipy `center_of_mass`. Then assembles `cache/phase2_train.npz` for the 60 train FOVs with labels assigned by nearest-GT-centroid matching (≤30 px → inherit GT label; else `background`). Also writes `cache/gene_vocab.json`. |
+| `train_classifier.py` | LightGBM multiclass trainer. `--label_level` chooses which hierarchy level to train on (default `subclass_label` — `cluster_label` is too sparse with 178 classes / 5390 cells, collapses to predict-background). Features: log1p-then-L2-normalized gene counts + `(global_x, global_y)` stage centroid (CCF coords aren't available for test cells). Per-row inverse-class-frequency `sample_weight` (sklearn-style `class_weight='balanced'` is silently ignored by `lgb.train`). Saves `model.txt`, `label_encoder.pkl`, `promotion_lookup.csv`, `train.log`, `val_predictions.npz`, `per_class_report.csv` under `runs/<run_name>/`. |
+| `predict.py` | Per-FOV inference + per-spot mask lookup → 4-column submission CSV. Reads `runs/<run_name>/{model.txt,label_encoder.pkl,promotion_lookup.csv,feature_meta.json}`. Promotes the predicted label to all 4 hierarchy levels via the run's `promotion_lookup.csv` (deterministic strict-hierarchy parents + most-common-within-group children). Per-spot lookup uses `cache/masks_phase2/<FOV>.npy[global_z, image_row, image_col]` — `cell_id == 0` → all-background. `--no_sample_align` for val runs (don't reorder against `sample_submission.csv`). |
+| `local_eval_phase2.py` | Phase 2 validator wrapping the official `metric.merfish_score`. Builds per-spot GT for the 10 val FOVs by rasterizing `cell_boundaries_train.csv` per `(FOV, z)` and looking up val spots. Prints overall mean ARI and per-level breakdown (per-FOV ARIs at each level). |
+
+## Phase 2 cache files (under `cache/`, all gitignored)
+
+| Path | Purpose | Approx size |
+| --- | --- | --- |
+| `gene_vocab.json` | 1147 gene names in `counts.var._index` order. Built by `build_expression.py` and reused by `train_classifier.py` / `predict.py`. | 11 KB |
+| `masks_phase2/<FOV>.npy` (×70) | uint16 `(5, 2048, 2048)` cellpose masks. | ~40 MB each |
+| `masks_phase2/cell_counts.csv` | Per-FOV cell counts (`fov, split, n_cells, seconds, skipped`). | 4 KB |
+| `expression_phase2/<FOV>.npz` (×70) | Per-FOV `matrix (n_cells, 1147) int32`, `cell_ids`, `centroids`, `fov_id`. | ~50 KB-1 MB each |
+| `phase2_train.npz` | Consolidated 60-train-FOV labeled set: `X_train (6420, 1147)`, `fov_ids`, `cell_ids`, `centroids`, `match_dist_px`, `gt_cell_ids`, `y_class/y_subclass/y_supertype/y_cluster`. | 30 MB |
+
+## Phase 2 runs and submissions
+
+| `runs/phase2_baseline/` | Phase 2 v1 — subclass LightGBM, log1p+L2 + stage coords. Local val mean ARI **0.5554**, Kaggle LB **0.61**. Contains `model.txt` (LightGBM Booster save), `label_encoder.pkl`, `promotion_lookup.csv` (subclass → 4 levels), `feature_meta.json`, `train_split.json` (which 60/10 FOVs were used), `train.log`, `val_predictions.npz`, `val_submission.csv`, `per_class_report.csv`. |
+| `submissions/phase2_v1_baseline.csv` | The Kaggle submission for Phase 2 v1 (438877 rows). Format-validated against `sample_submission.csv` (matching column order, row count, spot_id ordering, no nulls). |
+
+## Typical Phase 2 workflow
+
+```bash
+# 0. (Once) Phase 1 fine-tuned checkpoint must exist:
+ls runs/phase4_v1_h200/checkpoints/best.pt
+
+# 1. Bulk segmentation of all 70 Phase 2 FOVs (~17 min on L40S):
+sbatch run_segment_all_phase2.sh
+# → cache/masks_phase2/{FOV_101..FOV_160,FOV_E..FOV_N}.npy + cell_counts.csv
+
+# 2. Build per-cell expression matrices + consolidated train set (~3.5 min CPU):
+python3 scripts/phase2/build_expression.py
+# → cache/gene_vocab.json
+# → cache/expression_phase2/<FOV>.npz × 70
+# → cache/phase2_train.npz
+
+# 3. Train classifier (~6 min CPU at subclass level):
+python3 scripts/phase2/train_classifier.py --label_level subclass_label
+# → runs/phase2_baseline/
+
+# 4. Validate on the 10 val FOVs (~30 s):
+VAL_FOVS=$(cat phase2_val_fovs.txt | tr '\n' ' ')
+python3 scripts/phase2/predict.py \
+    --run_dir runs/phase2_baseline \
+    --fovs $VAL_FOVS \
+    --spots_csv /scratch/pl2820/data/competition_phase2/train/ground_truth/spots_train.csv \
+    --output runs/phase2_baseline/val_submission.csv \
+    --no_sample_align
+python3 scripts/phase2/local_eval_phase2.py \
+    --predicted runs/phase2_baseline/val_submission.csv
+
+# 5. Generate Kaggle submission (10 test FOVs, ~10 s):
+python3 scripts/phase2/predict.py \
+    --run_dir runs/phase2_baseline \
+    --output submissions/phase2_v1_baseline.csv
+
+# 6. Submit to Kaggle (or via the web UI):
+kaggle competitions submit -c <competition-name> \
+    -f submissions/phase2_v1_baseline.csv \
+    -m "Phase 2 v1 baseline: subclass LightGBM, local 0.555 / Kaggle 0.61"
 ```
