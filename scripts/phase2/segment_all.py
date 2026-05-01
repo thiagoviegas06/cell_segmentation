@@ -88,11 +88,18 @@ def segment_one(model, fov_dir: Path, stitch_threshold: float,
     feature_maps = []
     def hook_fn(module, inputs, output):
         # inputs[0] is the feature map before the final output convolution
-        feature_maps.append(inputs[0].detach().cpu().numpy())
+        # Cast to float32 because numpy doesn't support BFloat16 (used by SAM)
+        feature_maps.append(inputs[0].detach().float().cpu().numpy())
 
-    # In CellposeModel, the resnet backbone is in .net.
-    # The output block is usually the last part of the resnet.
-    hook = model.net.output.register_forward_hook(hook_fn)
+    # In CellposeModel, the network backbone is in .net.
+    # Standard CPnet uses .output, while Transformer (SAM/Segformer) uses .out.
+    if hasattr(model.net, "output"):
+        hook = model.net.output.register_forward_hook(hook_fn)
+    elif hasattr(model.net, "out"):
+        hook = model.net.out.register_forward_hook(hook_fn)
+    else:
+        log.error("Could not find 'output' or 'out' layer in model.net (%s)", type(model.net))
+        raise AttributeError(f"Model {type(model.net)} has no 'output' or 'out' layer.")
 
     try:
         masks, _flows, _styles = model.eval(
