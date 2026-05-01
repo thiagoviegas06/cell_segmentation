@@ -31,9 +31,9 @@ export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 # Configurable paths (defaults match the existing scripts)
-PRETRAINED_MODEL="${PRETRAINED_MODEL:-/scratch/$USER/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt}"
-DATA_ROOT="${DATA_ROOT:-/scratch/pl2820/data/competition_phase2}"
-OUTPUT_DIR="${OUTPUT_DIR:-/scratch/$USER/cell_segmentation/cache/masks_phase2}"
+export PRETRAINED_MODEL="${PRETRAINED_MODEL:-/scratch/$USER/cell_segmentation/runs/phase4_v1_h200/checkpoints/best.pt}"
+export DATA_ROOT="${DATA_ROOT:-/scratch/pl2820/data/competition_phase2}"
+export OUTPUT_DIR="${OUTPUT_DIR:-/scratch/$USER/cell_segmentation/cache/masks_phase2}"
 RUN_DIR="runs/phase2_pytorch"
 SUBMISSION_PATH="submissions/pytorch_embeddings_v1.csv"
 
@@ -51,7 +51,6 @@ singularity exec --nv \
   "$SIF" /bin/bash -s -- "$@" <<'EOF'
 set -euo pipefail
 source /ext3/env.sh
-conda activate my_writable_env
 
 cd /scratch/$USER/cell_segmentation
 
