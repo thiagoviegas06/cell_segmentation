@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import sys
 import time
@@ -193,26 +194,57 @@ def main() -> None:
     sol = gt.set_index("spot_id")
     sub = pred_val.set_index("spot_id")
     score = merfish_score(sol, sub)
-    log.info("=== mean ARI (official metric, %d FOVs × %d levels) = %.4f ===",
-             len(val_fovs), len(LEVELS), score)
 
-    # Per-level breakdown
+    # Per-FOV × per-level ARI table (used both for diagnostics and the
+    # final per-level mean summary).
     from sklearn.metrics import adjusted_rand_score
-    log.info("Per-level breakdown:")
+    sub_aligned = sub.reindex(sol.index)
+    rows = []
+    for fov in val_fovs:
+        fov_mask = (sol["fov"] == fov).to_numpy()
+        if not fov_mask.any():
+            continue
+        row = {"fov": fov}
+        for lvl in LEVELS:
+            gt_vals = sol.loc[fov_mask, lvl].astype(str).to_numpy()
+            pred_vals = sub_aligned.loc[fov_mask, lvl].astype(str).fillna(BG).to_numpy()
+            row[lvl] = adjusted_rand_score(gt_vals, pred_vals)
+        rows.append(row)
+    per_fov_df = pd.DataFrame(rows).set_index("fov")
+
+    level_means = {lvl: per_fov_df[lvl].mean() for lvl in LEVELS}
+
+    log.info("Per-FOV ARI by level:")
+    header = "  fov       " + "  ".join(f"{lvl:>9s}" for lvl in LEVELS)
+    log.info(header)
+    for fov, r in per_fov_df.iterrows():
+        cells = "  ".join(f"{r[lvl]:>9.4f}" for lvl in LEVELS)
+        log.info("  %-8s  %s", fov, cells)
+
+    log.info("=" * 60)
+    log.info("Mean ARI per level (averaged across %d val FOVs):", len(per_fov_df))
     for lvl in LEVELS:
-        per_fov = []
-        for fov in val_fovs:
-            mask = sol["fov"] == fov
-            if mask.sum() == 0:
-                continue
-            gt_vals = sol.loc[mask, lvl].astype(str).to_numpy()
-            pred_vals = sub.reindex(sol.index)[lvl].astype(str).fillna(BG).to_numpy()[mask]
-            ari = adjusted_rand_score(gt_vals, pred_vals)
-            per_fov.append((fov, ari))
-        per_df = pd.DataFrame(per_fov, columns=["fov","ari"])
-        log.info("  %-9s mean=%.4f  per-FOV: %s",
-                 lvl, per_df["ari"].mean(),
-                 [(f, round(a, 3)) for f, a in per_fov])
+        log.info("  %-9s  %.4f", lvl, level_means[lvl])
+    log.info("-" * 60)
+    log.info("Overall mean ARI (official metric, %d FOVs × %d levels): %.4f",
+             len(val_fovs), len(LEVELS), score)
+    log.info("=" * 60)
+
+    # Sibling summary.json next to the predicted CSV for programmatic readout.
+    summary_path = pred_path.with_suffix(".summary.json")
+    summary = {
+        "predicted_csv": str(pred_path),
+        "val_fovs": val_fovs,
+        "n_val_fovs": len(val_fovs),
+        "overall_mean_ari": float(score),
+        "per_level_mean_ari": {lvl: float(level_means[lvl]) for lvl in LEVELS},
+        "per_fov_per_level_ari": {
+            fov: {lvl: float(per_fov_df.loc[fov, lvl]) for lvl in LEVELS}
+            for fov in per_fov_df.index
+        },
+    }
+    summary_path.write_text(json.dumps(summary, indent=2))
+    log.info("Wrote %s", summary_path)
 
     return score
 

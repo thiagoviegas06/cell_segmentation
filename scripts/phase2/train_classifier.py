@@ -43,6 +43,10 @@ import pandas as pd
 from sklearn.metrics import classification_report
 from sklearn.preprocessing import LabelEncoder
 
+# Same-dir import: scripts/phase2/features.py
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import features as feat  # noqa: E402
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 # Constants duplicated from scripts/phase2/build_expression.py — kept inline
@@ -66,26 +70,16 @@ LABELS_CSV = Path("/scratch/pl2820/data/competition_phase2/train/ground_truth/ce
 DEFAULT_RUN_DIR = _PROJECT_ROOT / "runs" / "phase2_baseline"
 
 
-def normalize_counts(X: np.ndarray) -> np.ndarray:
-    """log1p then per-cell L2 normalize across the 1147 gene dims."""
-    X = np.log1p(X.astype(np.float32))
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return X / norms
-
-
-def stage_xy(centroids: np.ndarray, fov_ids: np.ndarray,
-             fov_meta: pd.DataFrame) -> np.ndarray:
-    """Convert per-cell (image_row, image_col) centroids to (global_x, global_y) µm."""
-    out = np.empty((len(centroids), 2), dtype=np.float32)
+def fov_xy_per_cell(fov_ids: np.ndarray, fov_meta: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """Look up (fov_x, fov_y) µm offset for each cell from its fov id."""
+    fx = np.empty(len(fov_ids), dtype=np.float32)
+    fy = np.empty(len(fov_ids), dtype=np.float32)
     for fov in np.unique(fov_ids):
         m = fov_meta.loc[fov]
         idx = np.where(fov_ids == fov)[0]
-        rows = centroids[idx, 0]
-        cols = centroids[idx, 1]
-        out[idx, 0] = m.fov_x + (IMG_H - rows) * PIXEL_SIZE
-        out[idx, 1] = m.fov_y + cols * PIXEL_SIZE
-    return out
+        fx[idx] = m.fov_x
+        fy[idx] = m.fov_y
+    return fx, fy
 
 
 def build_promotion_lookup(labels_df: pd.DataFrame, level: str) -> pd.DataFrame:
@@ -135,6 +129,22 @@ def main() -> None:
     ap.add_argument("--use_balanced_weights", action="store_true", default=True,
                     help="Per-row inverse-class-frequency weights (replaces lgb's "
                          "non-existent class_weight param)")
+    ap.add_argument("--extras", default="global_x_um,global_y_um",
+                    help="Comma-separated subset of features.EXTRA_FEATURE_NAMES "
+                         "to include. Default = baseline (just stage coords).")
+    ap.add_argument("--neighbor_K", type=int, default=0,
+                    help="If >0, include the mean log1p+L2 expression of K "
+                         "same-FOV nearest neighbors as additional features. "
+                         "Default 0 = disabled.")
+    ap.add_argument("--dropout_copies", type=int, default=0,
+                    help="If >0, generate this many spot-dropout-augmented "
+                         "copies of each train cell in addition to the original. "
+                         "Each copy resamples per-gene counts as "
+                         "Binomial(count, keep_p) with keep_p ~ U(p_min, p_max). "
+                         "Simulates the low-spot-density regime seen in some FOVs.")
+    ap.add_argument("--dropout_p_min", type=float, default=0.5)
+    ap.add_argument("--dropout_p_max", type=float, default=1.0)
+    ap.add_argument("--dropout_seed", type=int, default=0)
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -154,6 +164,9 @@ def main() -> None:
     y_target = data[label_key].astype(str)     # (N,) string labels
     fov_ids = data["fov_ids"].astype(str)
     centroids = data["centroids"].astype(np.float32)
+    if "mask_volume_px" not in data.files:
+        raise RuntimeError("phase2_train.npz missing mask_volume_px — run augment_train_cache.py first")
+    mask_volume_px = data["mask_volume_px"].astype(np.int64)
     log.info("  X_train shape=%s, training on %s (unique=%d), FOVs=%d",
              X_raw.shape, args.label_level, len(np.unique(y_target)), len(np.unique(fov_ids)))
 
@@ -162,18 +175,62 @@ def main() -> None:
 
     fov_meta = pd.read_csv(FOV_META_CSV).set_index("fov")
 
-    # ---- Feature pipeline
-    log.info("Building features (log1p + L2 normalize + 2 stage coords)...")
-    X_norm = normalize_counts(X_raw)                          # (N, 1147)
-    stage = stage_xy(centroids, fov_ids, fov_meta)            # (N, 2)
-    X = np.concatenate([X_norm, stage], axis=1).astype(np.float32)
-    log.info("  X.shape=%s", X.shape)
+    # ---- Feature pipeline (delegates to features.py for shared train/predict consistency)
+    extras_keep = [n.strip() for n in args.extras.split(",") if n.strip()]
+    log.info("Building features: log1p+L2 gene matrix + extras=%s + neighbor_K=%d",
+             extras_keep, args.neighbor_K)
+    X_norm = feat.normalize_counts(X_raw)                     # (N, n_genes)
+    fov_x, fov_y = fov_xy_per_cell(fov_ids, fov_meta)
+    extras_full = feat.build_extra_features(X_raw, centroids, mask_volume_px,
+                                             fov_x, fov_y)
+    extras, extras_names = feat.select_extras(extras_full, extras_keep)
+    parts = [X_norm, extras]
+    if args.neighbor_K > 0:
+        log.info("  building neighbor-mean features (K=%d, per-FOV)...", args.neighbor_K)
+        nbr_mean = feat.build_neighbor_mean(X_raw, centroids, fov_ids,
+                                             K=args.neighbor_K)
+        parts.append(nbr_mean)
+    X = np.concatenate(parts, axis=1).astype(np.float32)
+    n_neighbor_dims = X_norm.shape[1] if args.neighbor_K > 0 else 0
+    log.info("  X.shape=%s  (n_genes=%d, n_extras=%d, n_neighbor=%d)",
+             X.shape, X_norm.shape[1], extras.shape[1], n_neighbor_dims)
 
     # Group split: cells from val FOVs go to val
     val_mask = np.isin(fov_ids, val_fovs)
     train_mask = ~val_mask
     X_tr, y_tr_str = X[train_mask], y_target[train_mask]
     X_va, y_va_str = X[val_mask], y_target[val_mask]
+
+    # Spot-dropout augmentation (training only): resample raw counts as
+    # Binomial(count, keep_p) with keep_p ~ U(p_min, p_max), then renormalize.
+    # Extras and neighbor features are replicated unchanged across copies
+    # (they don't depend on per-cell count noise the same way).
+    if args.dropout_copies > 0:
+        rng = np.random.default_rng(args.dropout_seed)
+        log.info("Spot-dropout augmentation: %d extra copies, keep_p ~ U(%.2f, %.2f)",
+                 args.dropout_copies, args.dropout_p_min, args.dropout_p_max)
+        X_raw_tr = X_raw[train_mask]
+        extras_tr = extras[train_mask]
+        if args.neighbor_K > 0:
+            nbr_tr = nbr_mean[train_mask]
+        aug_X_list = [X_tr]
+        aug_y_list = [y_tr_str]
+        for k in range(args.dropout_copies):
+            keep_p = rng.uniform(args.dropout_p_min, args.dropout_p_max,
+                                 size=(X_raw_tr.shape[0], 1)).astype(np.float32)
+            # Per-cell binomial subsampling (vectorized per cell)
+            X_sub = rng.binomial(X_raw_tr.astype(np.int64), keep_p).astype(np.int32)
+            X_sub_norm = feat.normalize_counts(X_sub)
+            parts_aug = [X_sub_norm, extras_tr]
+            if args.neighbor_K > 0:
+                parts_aug.append(nbr_tr)
+            aug_X_list.append(np.concatenate(parts_aug, axis=1).astype(np.float32))
+            aug_y_list.append(y_tr_str)
+        X_tr = np.concatenate(aug_X_list, axis=0)
+        y_tr_str = np.concatenate(aug_y_list, axis=0)
+        log.info("  augmented train: %d cells (%d original + %d augmented)",
+                 len(X_tr), train_mask.sum(), len(X_tr) - train_mask.sum())
+
     log.info("  train cells=%d, val cells=%d", len(X_tr), len(X_va))
     log.info("  train labels=%d, val labels=%d (overlap=%d)",
              len(np.unique(y_tr_str)), len(np.unique(y_va_str)),
@@ -281,9 +338,11 @@ def main() -> None:
         pickle.dump(le, f)
 
     feat_meta = {
-        "n_genes": X_norm.shape[1],
-        "n_extra_features": stage.shape[1],
-        "extra_feature_names": ["global_x_um", "global_y_um"],
+        "n_genes": int(X_norm.shape[1]),
+        "n_extra_features": int(extras.shape[1]),
+        "extra_feature_names": extras_names,
+        "neighbor_K": int(args.neighbor_K),
+        "n_neighbor_features": int(n_neighbor_dims),
         "normalization": "log1p_then_l2",
         "pixel_size_um": PIXEL_SIZE,
     }

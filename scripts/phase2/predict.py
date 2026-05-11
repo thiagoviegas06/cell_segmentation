@@ -43,12 +43,14 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+# Same-dir import: scripts/phase2/features.py
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import features as feat  # noqa: E402
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 LABEL_LEVELS = ["class_label", "subclass_label", "supertype_label", "cluster_label"]
 SUBMISSION_LEVELS = ["class", "subclass", "supertype", "cluster"]
-IMG_H, IMG_W = 2048, 2048
-PIXEL_SIZE = 0.109
 BG = "background"
 
 DATA_ROOT = Path("/scratch/pl2820/data/competition_phase2")
@@ -67,28 +69,100 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def normalize_counts(X: np.ndarray) -> np.ndarray:
-    X = np.log1p(X.astype(np.float32))
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return X / norms
+def build_features_for_fov(matrix, centroids, mask, fov_x, fov_y, cell_ids,
+                            extras_keep, neighbor_K, fov_id):
+    """
+    Compose the full (n, F) feature matrix for one FOV. Mirrors
+    train_classifier.py exactly via features.py — same extras subset, same
+    neighbor_K, same ordering.
+    """
+    n = len(cell_ids)
+    max_id = int(mask.max())
+    vols_full = feat.compute_mask_volumes(mask, max_id)
+    cids = np.asarray(cell_ids).astype(np.int64)
+    in_range = (cids >= 1) & (cids <= max_id)
+    mask_volume_px = np.zeros(n, dtype=np.int64)
+    mask_volume_px[in_range] = vols_full[cids[in_range]]
+
+    fov_x_arr = np.full(n, fov_x, dtype=np.float32)
+    fov_y_arr = np.full(n, fov_y, dtype=np.float32)
+    X_norm = feat.normalize_counts(matrix)
+    extras_full = feat.build_extra_features(matrix, centroids, mask_volume_px,
+                                             fov_x_arr, fov_y_arr)
+    extras, _ = feat.select_extras(extras_full, extras_keep)
+    parts = [X_norm, extras]
+    if neighbor_K > 0:
+        # All cells here belong to a single FOV, so fov_ids is constant.
+        fov_ids_arr = np.full(n, fov_id, dtype=object)
+        nbr_mean = feat.build_neighbor_mean(matrix, centroids, fov_ids_arr,
+                                             K=neighbor_K)
+        parts.append(nbr_mean)
+    return np.concatenate(parts, axis=1).astype(np.float32)
 
 
-def stage_xy(centroids: np.ndarray, fov_x: float, fov_y: float) -> np.ndarray:
-    rows = centroids[:, 0]
-    cols = centroids[:, 1]
-    out = np.empty((len(centroids), 2), dtype=np.float32)
-    out[:, 0] = fov_x + (IMG_H - rows) * PIXEL_SIZE
-    out[:, 1] = fov_y + cols * PIXEL_SIZE
-    return out
+class ClusterHeads:
+    """Container for per-subclass cluster heads + cluster -> higher-level lookup.
+
+    Built by scripts/phase2/train_cluster_heads.py. Loaded once and consulted
+    in predict_fov_cell_labels.
+    """
+
+    def __init__(self, heads_dir: Path,
+                 only_subclasses: set[str] | None = None) -> None:
+        self.heads_dir = heads_dir
+        meta = json.loads((heads_dir / "heads_meta.json").read_text())
+        self.cluster_to_higher = (
+            pd.read_csv(heads_dir / "cluster_to_higher.csv")
+            .set_index("cluster_label")
+        )
+        self.subclass_to_head: dict[str, tuple[lgb.Booster, np.ndarray]] = {}
+        for subclass, info in meta["subclass_to_head"].items():
+            if info.get("skipped"):
+                continue
+            if only_subclasses is not None and subclass not in only_subclasses:
+                continue
+            head_subdir = _PROJECT_ROOT / info["head_dir"]
+            booster = lgb.Booster(model_file=str(head_subdir / "model.txt"))
+            label_classes = np.array(
+                json.loads((head_subdir / "label_classes.json").read_text())
+            )
+            self.subclass_to_head[subclass] = (booster, label_classes)
+        log.info("Loaded %d cluster heads from %s", len(self.subclass_to_head), heads_dir)
+
+    def has_head(self, subclass: str) -> bool:
+        return subclass in self.subclass_to_head
+
+    def predict_clusters(self, subclass: str, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (cluster_pred, max_proba) for each row in X."""
+        booster, label_classes = self.subclass_to_head[subclass]
+        proba = booster.predict(X)
+        idx = proba.argmax(axis=1)
+        return label_classes[idx], proba.max(axis=1)
+
+    def labels_from_cluster(self, cluster: str) -> dict[str, str] | None:
+        if cluster not in self.cluster_to_higher.index:
+            return None
+        row = self.cluster_to_higher.loc[cluster]
+        return {
+            "class":     row["class_label"],
+            "subclass":  row["subclass_label"],
+            "supertype": row["supertype_label"],
+            "cluster":   cluster,
+        }
 
 
 def predict_fov_cell_labels(
     fov_id: str,
+    mask: np.ndarray,
     model: lgb.Booster,
     label_classes: np.ndarray,
     promotion: pd.DataFrame,
     fov_meta: pd.DataFrame,
+    bg_threshold: float = 0.0,
+    cluster_heads: ClusterHeads | None = None,
+    subclass_threshold: float = 0.0,
+    head_threshold: float = 0.0,
+    feature_cfg: dict | None = None,
 ) -> dict:
     """
     Returns dict cell_id -> {class, subclass, supertype, cluster}.
@@ -96,6 +170,14 @@ def predict_fov_cell_labels(
     trained at any of the 4 hierarchy levels — `promotion` maps each
     predicted value to all 4 columns (deterministic parent + most-common
     child rollouts).
+
+    bg_threshold: if a cell's max-class probability is below this value,
+    the cell is forced to all-background. 0.0 = never demote (baseline).
+
+    cluster_heads: optional. When provided, cells whose predicted subclass
+    has a cluster head AND whose subclass max_proba >= subclass_threshold
+    get their (cluster, supertype, class) labels from the head + the
+    cluster->higher lookup instead of the deterministic majority rollout.
     """
     expr_path = EXPR_DIR / f"{fov_id}.npz"
     if not expr_path.exists():
@@ -108,19 +190,26 @@ def predict_fov_cell_labels(
     if n == 0:
         return {}
 
-    X_norm = normalize_counts(matrix)
     m = fov_meta.loc[fov_id]
-    stage = stage_xy(centroids, m.fov_x, m.fov_y)
-    X = np.concatenate([X_norm, stage], axis=1).astype(np.float32)
+    X = build_features_for_fov(matrix, centroids, mask, m.fov_x, m.fov_y, cell_ids,
+                                extras_keep=feature_cfg["extras_keep"],
+                                neighbor_K=feature_cfg["neighbor_K"],
+                                fov_id=fov_id)
 
     proba = model.predict(X)
     pred_idx = proba.argmax(axis=1)
     pred_label = label_classes[pred_idx]
+    max_proba = proba.max(axis=1)
 
-    # Promote each predicted label to all 4 hierarchy levels.
+    if bg_threshold > 0:
+        n_low_conf = int((max_proba < bg_threshold).sum())
+        log.info("  %s: %d/%d cells below bg_threshold %.2f -> demoted to background",
+                 fov_id, n_low_conf, n, bg_threshold)
+
+    # First pass: deterministic majority rollout (or background) for every cell.
     out: dict[int, dict[str, str]] = {}
-    for cid, val in zip(cell_ids, pred_label):
-        if val == BG or val not in promotion.index:
+    for cid, val, p in zip(cell_ids, pred_label, max_proba):
+        if val == BG or val not in promotion.index or p < bg_threshold:
             out[int(cid)] = {sub: BG for sub in SUBMISSION_LEVELS}
         else:
             row = promotion.loc[val]
@@ -130,16 +219,47 @@ def predict_fov_cell_labels(
                 "supertype": row["supertype_label"],
                 "cluster":   row["cluster_label"],
             }
+
+    # Second pass: route cells through their subclass-specific cluster head when
+    # available and the subclass call is confident enough. Batches per subclass
+    # so each head's predict() is called once.
+    if cluster_heads is not None:
+        eligible = (max_proba >= subclass_threshold) & (max_proba >= bg_threshold) & (pred_label != BG)
+        for subclass in np.unique(pred_label[eligible]):
+            if not cluster_heads.has_head(subclass):
+                continue
+            subclass_mask = eligible & (pred_label == subclass)
+            idx = np.where(subclass_mask)[0]
+            if len(idx) == 0:
+                continue
+            X_sub = X[idx]
+            cluster_preds, head_proba = cluster_heads.predict_clusters(subclass, X_sub)
+            cell_ids_sub = cell_ids[idx]
+            n_routed = 0
+            n_head_low_conf = 0
+            for cid, cluster, hp in zip(cell_ids_sub, cluster_preds, head_proba):
+                if hp < head_threshold:
+                    n_head_low_conf += 1
+                    continue   # head too uncertain -> keep majority fallback
+                lbls = cluster_heads.labels_from_cluster(cluster)
+                if lbls is None:
+                    continue   # cluster not in lookup — keep majority fallback
+                out[int(cid)] = lbls
+                n_routed += 1
+            log.info("  %s: routed %d cells through cluster head [%s] (k=%d clusters%s)",
+                     fov_id, n_routed, subclass,
+                     len(cluster_heads.subclass_to_head[subclass][1]),
+                     f", {n_head_low_conf} below head_threshold {head_threshold:.2f}"
+                     if head_threshold > 0 else "")
     return out
 
 
 def build_submission_for_fov(
     fov_id: str,
+    mask: np.ndarray,
     cell_to_labels: dict[int, dict[str, str]],
     spots: pd.DataFrame,    # already filtered to this FOV
 ) -> pd.DataFrame:
-    mask_path = MASK_DIR / f"{fov_id}.npy"
-    mask = np.load(mask_path)
     Z, H, W = mask.shape
     zs = np.rint(spots["global_z"].to_numpy()).astype(np.int64)
     rows = spots["image_row"].to_numpy().astype(np.int64)
@@ -193,6 +313,27 @@ def main() -> None:
                     help="Optional: for spot_id ordering and row-count verification")
     ap.add_argument("--no_sample_align", action="store_true",
                     help="Skip aligning rows to sample_submission (use for val runs)")
+    ap.add_argument("--bg_threshold", type=float, default=0.0,
+                    help="Per-cell max-proba threshold below which the cell "
+                         "is forced to background at all 4 levels. Default 0.0 "
+                         "(no demotion).")
+    ap.add_argument("--cluster_heads_dir", default=None,
+                    help="If set, route cells through per-subclass cluster heads "
+                         "from this dir (e.g. runs/phase2_clusterheads). Default "
+                         "off -> baseline majority rollout.")
+    ap.add_argument("--subclass_threshold", type=float, default=0.0,
+                    help="Min subclass max-proba to route a cell through its "
+                         "cluster head. Cells below it use the majority rollout. "
+                         "Only meaningful with --cluster_heads_dir.")
+    ap.add_argument("--head_threshold", type=float, default=0.0,
+                    help="Min cluster-head max-proba to keep the head's cluster "
+                         "prediction. Cells where the head is uncertain fall "
+                         "back to majority rollout. Only meaningful with "
+                         "--cluster_heads_dir.")
+    ap.add_argument("--head_subclasses", nargs="+", default=None,
+                    help="Optional whitelist of subclass labels for which to "
+                         "actually use the head (others fall back to majority "
+                         "even if a head exists). Default: use all available heads.")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -210,8 +351,21 @@ def main() -> None:
     feat_meta = json.loads((run_dir / "feature_meta.json").read_text())
     trained_level = feat_meta.get("trained_label_level", "cluster_label")
     promotion = pd.read_csv(run_dir / "promotion_lookup.csv").set_index(trained_level, drop=False)
+    feature_cfg = {
+        "extras_keep": feat_meta.get("extra_feature_names", ["global_x_um", "global_y_um"]),
+        "neighbor_K": int(feat_meta.get("neighbor_K", 0)),
+    }
     log.info("  model classes=%d, promotion entries=%d, trained at %s",
              len(label_classes), len(promotion), trained_level)
+    log.info("  feature config: extras=%s, neighbor_K=%d",
+             feature_cfg["extras_keep"], feature_cfg["neighbor_K"])
+
+    cluster_heads = None
+    if args.cluster_heads_dir:
+        only = set(args.head_subclasses) if args.head_subclasses else None
+        cluster_heads = ClusterHeads(Path(args.cluster_heads_dir), only_subclasses=only)
+        log.info("Cluster head routing enabled (subclass_threshold=%.2f)",
+                 args.subclass_threshold)
 
     fov_meta = pd.read_csv(FOV_META_CSV).set_index("fov")
     log.info("Loading spot table %s", args.spots_csv)
@@ -233,9 +387,16 @@ def main() -> None:
         if len(spots_fov) == 0:
             log.warning("  %s: 0 spots in spot table", fov)
             continue
-        cell_labels = predict_fov_cell_labels(fov, model, label_classes,
-                                               promotion, fov_meta)
-        sub_fov = build_submission_for_fov(fov, cell_labels, spots_fov)
+        mask_path = MASK_DIR / f"{fov}.npy"
+        mask = np.load(mask_path)
+        cell_labels = predict_fov_cell_labels(fov, mask, model, label_classes,
+                                               promotion, fov_meta,
+                                               bg_threshold=args.bg_threshold,
+                                               cluster_heads=cluster_heads,
+                                               subclass_threshold=args.subclass_threshold,
+                                               head_threshold=args.head_threshold,
+                                               feature_cfg=feature_cfg)
+        sub_fov = build_submission_for_fov(fov, mask, cell_labels, spots_fov)
         pieces.append(sub_fov)
     log.info("Per-FOV inference done in %.1fs", time.time() - t_total)
 
