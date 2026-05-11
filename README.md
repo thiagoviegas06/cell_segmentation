@@ -8,8 +8,8 @@ Working directory for the two-phase MERFISH Kaggle task:
 - **Competition Phase 2 — cell-type classification.** Predict 4-level
   Allen Brain Cell Atlas labels per spot (class / subclass / supertype /
   cluster) using the Phase 1 segmentation as a fixed input. Subclass
-  LightGBM baseline currently **0.61 LB** (see "Phase 2 — cell-type
-  classification" near the bottom).
+  LightGBM + per-subclass cluster heads currently **0.6171 LB** (v3, see
+  "Phase 2 — cell-type classification" near the bottom).
 
 The original end-to-end Phase 1 pipeline (`pipeline.py`) produces a
 zero-shot `submission.csv` for the public leaderboard; everything under
@@ -146,6 +146,8 @@ Phase 2), see further down.
 | `summary.txt` | Running notes across all Phase 1 segmentation steps: data-structure findings, verification steps, deliverables, and the outstanding work queue. Read this first for Phase 1 context. |
 | `val_fovs.txt` | Committed 6-FOV validation split for the Phase 1 segmentation work (stratified across cell-density range). Consumed by `local_eval.py` via `--val_fovs`. Distinct from the Phase 2 split (`phase2_val_fovs.txt`) and from `train_cellpose.py`'s in-training val split. |
 | `phase2_val_fovs.txt` | Committed 10-FOV validation split for **Phase 2 (cell-type classification)**, stratified by cell count from `cache/masks_phase2/cell_counts.csv`. Excludes FOV_147 (kept in train because it holds 100% of `29 CB Glut` cells). Consumed by `scripts/phase2/train_classifier.py` and `scripts/phase2/local_eval_phase2.py`. |
+| `phase2_val_hard5.txt`, `phase2_val_hard7.txt` | "Test-like" subsets of the Phase 2 val split, picked by per-FOV spots/cell density to mirror the test FOVs. Tested in Phase 2.8 — modest Spearman improvement vs full val but neither subset picks the LB winner, so LB stays the source of truth. |
+| `phase2_summary.md` | Phase 2 running notes: per-variant submission table, diagnostics (FOV_140 distribution shift, bg/named confusion, LightGBM overfit gap), the hard-val experiment, and the priority-ordered backlog of untried ideas. |
 | `run_segment_all_phase2.sh` | SLURM launcher (1×L40S, 2 h) for `scripts/phase2/segment_all.py` — bulk 3D-stitched segmentation of all 70 Phase 2 FOVs (60 train + 10 test). Env vars: `PRETRAINED_MODEL`, `DATA_ROOT`, `OUTPUT_DIR`, `STITCH_THRESHOLD`, `DIAMETER`. Forwards extra args (e.g. `--fovs FOV_E` for a smoke test). |
 | `run.log` | Log from an early pipeline run, kept only for reference. |
 
@@ -208,7 +210,8 @@ Kaggle-format outputs written by `infer_test.py` / `pipeline_v2.py` /
 | --- | --- | --- |
 | `phase4_v1_h200_submission.csv` | `run_infer_test.sh` on `phase4_v1_h200/checkpoints/best.pt` | 0.76 |
 | `phase5_v1_h200_submission.csv` | `run_infer_test_v2.sh` on same checkpoint, 3D-stitched path | **0.83** |
-| `phase2_v1_baseline.csv` | `scripts/phase2/predict.py` on `runs/phase2_baseline/` (subclass LightGBM, hierarchy rollout) | **0.61** |
+| `phase2_v1_baseline.csv` | `scripts/phase2/predict.py` on `runs/phase2_baseline/` (subclass LightGBM, hierarchy rollout) | 0.61 |
+| `phase2_v3_chead.csv` | `scripts/phase2/predict.py` on `runs/phase2_baseline/` + `runs/phase2_clusterheads/` (subclass LightGBM + per-subclass cluster heads) | **0.6171** |
 
 ## `logs/`
 
@@ -277,10 +280,8 @@ pairs. Phase 1 segmentation is reused as-is — the Phase 2 work is the
 classifier and evaluation stack on top.
 
 Phase 2 data lives at `/scratch/pl2820/data/competition_phase2/` (60
-train FOVs `FOV_101..FOV_160` + the 10 test FOVs). Strategy and
-findings live in `handoff.md` (gitignored — session-state only). Memory
-file at `~/.claude/projects/-scratch-tjv235-cell-segmentation/memory/project_merfish_segmentation.md`
-has the durable rules.
+train FOVs `FOV_101..FOV_160` + the 10 test FOVs). Running notes,
+diagnostics, and per-submission verdicts live in `phase2_summary.md`.
 
 ## Phase 2 — at a glance
 
@@ -289,7 +290,11 @@ has the durable rules.
 | 2.1 | Data discovery (schemas, gene panels, label hierarchy, normalization) | (offline analysis only) | — | — |
 | 2.2 | Re-segment all 70 Phase 2 FOVs with the Phase 1 fine-tuned model | `scripts/phase2/segment_all.py`, `run_segment_all_phase2.sh` | — | n/a (segmentation step) |
 | 2.3 | Per-cell gene-expression vectors + GT centroid matching | `scripts/phase2/build_expression.py` | — | 76% match rate |
-| 2.4 v1 | LightGBM subclass classifier + deterministic hierarchy rollout | `scripts/phase2/{train_classifier,predict,local_eval_phase2}.py` | **0.61** | 0.5554 |
+| 2.4 v1 | LightGBM subclass classifier + deterministic hierarchy rollout | `scripts/phase2/{train_classifier,predict,local_eval_phase2}.py` | 0.61 | 0.5554 |
+| 2.5 v3 | + per-subclass cluster heads (17 heads override the deterministic cluster rollout) | `scripts/phase2/train_cluster_heads.py`, `predict.py` | **0.6171** | 0.5739 |
+| 2.7 | Variants explored: extra features (`features.py`), gene-dropout augmentation, KNN-in-expression neighbor features, ensembling — all underperformed v3 on LB. See `phase2_summary.md` for the full per-variant table. | `train_classifier.py --extras/--neighbor_K/--dropout_*`, `predict_ensemble.py` | — | — |
+| 2.8 | "Test-like" hard val subsets (`phase2_val_hard{5,7}.txt`) — modest Spearman improvement vs full val but still doesn't pick the LB winner. Conclusion: trust LB. | `phase2_val_hard5.txt`, `phase2_val_hard7.txt` | — | — |
+| 2.9 | Two-stage bg-vs-named gate before subclass routing (untested on LB). | `scripts/phase2/{train_bg_gate,predict_with_bg_gate}.py` | — | — |
 
 ## `scripts/phase2/`
 
@@ -297,9 +302,15 @@ has the durable rules.
 | --- | --- |
 | `segment_all.py` | 3D-stitched cellpose inference over all 70 Phase 2 FOVs using the Phase 1 fine-tuned checkpoint (`runs/phase4_v1_h200/checkpoints/best.pt`). Same `model.eval(stitch_threshold=0.3, channel_axis=-1, z_axis=0, do_3D=False, normalize=False)` as `pipeline_v2.py`. Saves uint16 `(5, 2048, 2048)` masks to `cache/masks_phase2/<FOV>.npy` plus a `cell_counts.csv`. Resumes (skips already-saved FOVs) unless `--overwrite`. |
 | `build_expression.py` | For each FOV, builds a `(n_cells, 1147)` int32 gene-count matrix by per-spot mask lookup. Drops `blank-*` decoys. Computes per-cell `(image_row, image_col)` centroids via scipy `center_of_mass`. Then assembles `cache/phase2_train.npz` for the 60 train FOVs with labels assigned by nearest-GT-centroid matching (≤30 px → inherit GT label; else `background`). Also writes `cache/gene_vocab.json`. |
-| `train_classifier.py` | LightGBM multiclass trainer. `--label_level` chooses which hierarchy level to train on (default `subclass_label` — `cluster_label` is too sparse with 178 classes / 5390 cells, collapses to predict-background). Features: log1p-then-L2-normalized gene counts + `(global_x, global_y)` stage centroid (CCF coords aren't available for test cells). Per-row inverse-class-frequency `sample_weight` (sklearn-style `class_weight='balanced'` is silently ignored by `lgb.train`). Saves `model.txt`, `label_encoder.pkl`, `promotion_lookup.csv`, `train.log`, `val_predictions.npz`, `per_class_report.csv` under `runs/<run_name>/`. |
-| `predict.py` | Per-FOV inference + per-spot mask lookup → 4-column submission CSV. Reads `runs/<run_name>/{model.txt,label_encoder.pkl,promotion_lookup.csv,feature_meta.json}`. Promotes the predicted label to all 4 hierarchy levels via the run's `promotion_lookup.csv` (deterministic strict-hierarchy parents + most-common-within-group children). Per-spot lookup uses `cache/masks_phase2/<FOV>.npy[global_z, image_row, image_col]` — `cell_id == 0` → all-background. `--no_sample_align` for val runs (don't reorder against `sample_submission.csv`). |
-| `local_eval_phase2.py` | Phase 2 validator wrapping the official `metric.merfish_score`. Builds per-spot GT for the 10 val FOVs by rasterizing `cell_boundaries_train.csv` per `(FOV, z)` and looking up val spots. Prints overall mean ARI and per-level breakdown (per-FOV ARIs at each level). |
+| `augment_train_cache.py` | One-shot post-processor: reads each FOV's mask once, computes per-cell pixel volume (3D sum over z), and writes a `mask_volume_px` array back into `cache/phase2_train.npz` aligned positionally with `X_train`. Run once after `build_expression.py`. Idempotent. Required before training with `--extras` that includes `mask_volume_px`. |
+| `features.py` | Shared per-cell feature builder for Phase 2. Owns the canonical input-vector layout (1147 log1p+L2 gene counts, in `cache/gene_vocab.json` order, then K extra features named in `EXTRA_FEATURE_NAMES`: `log1p_total_count`, `log1p_n_genes_detected`, `log1p_mask_volume_px`, `global_{x,y}_um`, `image_{row,col}_norm`). `train_classifier.py`, `train_bg_gate.py`, `predict.py`, and `predict_ensemble.py` all build features through this module so train and inference stay bit-identical. |
+| `train_classifier.py` | LightGBM multiclass trainer. `--label_level` chooses which hierarchy level to train on (default `subclass_label` — `cluster_label` is too sparse with 178 classes / 5390 cells, collapses to predict-background). Features: log1p-then-L2-normalized gene counts + extras chosen via `--extras` (default v1: `global_x_um,global_y_um`). Optional `--neighbor_K` adds K-NN-in-expression features. Optional `--dropout_copies / --dropout_p_min / --dropout_p_max` synthesize gene-dropout augmented training rows. Per-row inverse-class-frequency `sample_weight` (sklearn-style `class_weight='balanced'` is silently ignored by `lgb.train`). Saves `model.txt`, `label_encoder.pkl`, `promotion_lookup.csv`, `feature_meta.json`, `train.log`, `val_predictions.npz`, `per_class_report.csv` under `runs/<run_name>/`. |
+| `train_cluster_heads.py` | Per-subclass cluster-level head trainer (v3). For each subclass with ≥`--min_cells` training cells AND >1 cluster, trains a small LightGBM head targeting `cluster_label` on the SAME 1149-dim feature vector as the subclass classifier. Writes `runs/<run_name>/heads/<subclass_safe>/{model.txt,label_classes.json,train.log}`, `cluster_to_higher.csv` (cluster → subclass/supertype/class), and `heads_meta.json`. With the default `--min_cells 20`, 17 heads are trained out of 41 subclasses. |
+| `train_bg_gate.py` | Two-stage step 1: trains a binary bg-vs-named LightGBM classifier on the v1 feature set (1147 log1p+L2 genes + 2 stage coords). Outputs `runs/phase2_bggate/{model.txt, feature_meta.json, train_split.json, val_predictions.npz}`. |
+| `predict.py` | Per-FOV inference + per-spot mask lookup → 4-column submission CSV. Reads `runs/<run_name>/{model.txt,label_encoder.pkl,promotion_lookup.csv,feature_meta.json}`. Optional `--cluster_heads_dir runs/phase2_clusterheads` routes named cells through the matching per-subclass head — its argmax cluster overrides the deterministic rollout (this is what gets v3 from 0.61 to 0.6171 LB). Per-spot lookup uses `cache/masks_phase2/<FOV>.npy[global_z, image_row, image_col]` — `cell_id == 0` → all-background. `--no_sample_align` for val runs (don't reorder against `sample_submission.csv`). |
+| `predict_ensemble.py` | Ensemble of multiple subclass-level runs: averages per-class probabilities across `--run_dirs`, takes argmax, then optionally routes through cluster heads. All runs must share the same subclass label space (verified at load). Underperformed the single v3 model on LB but kept for future variant mixing. |
+| `predict_with_bg_gate.py` | Two-stage step 2: hierarchical predictor. For each cell, run the bg-gate first; cells with `p_named < T` (default 0.5) get all-background labels, otherwise route through the v3 subclass + cluster-head pipeline. Untested on LB. |
+| `local_eval_phase2.py` | Phase 2 validator wrapping the official `metric.merfish_score`. Builds per-spot GT for the 10 val FOVs by rasterizing `cell_boundaries_train.csv` per `(FOV, z)` and looking up val spots. Prints overall mean ARI and per-level breakdown (per-FOV ARIs at each level). Optional `--val_fovs` flag accepts a custom subset (e.g. `phase2_val_hard5.txt`). |
 
 ## Phase 2 cache files (under `cache/`, all gitignored)
 
@@ -314,7 +325,10 @@ has the durable rules.
 ## Phase 2 runs and submissions
 
 | `runs/phase2_baseline/` | Phase 2 v1 — subclass LightGBM, log1p+L2 + stage coords. Local val mean ARI **0.5554**, Kaggle LB **0.61**. Contains `model.txt` (LightGBM Booster save), `label_encoder.pkl`, `promotion_lookup.csv` (subclass → 4 levels), `feature_meta.json`, `train_split.json` (which 60/10 FOVs were used), `train.log`, `val_predictions.npz`, `val_submission.csv`, `per_class_report.csv`. |
+| `runs/phase2_clusterheads/` | Phase 2 v3 cluster-head bundle. 17 per-subclass LightGBM heads + `cluster_to_higher.csv` + `heads_meta.json`. Used together with `runs/phase2_baseline/` via `predict.py --cluster_heads_dir`. Stacks on top of the subclass classifier — class/subclass predictions are unchanged, cluster/supertype gain resolution (48 unique clusters predicted vs 25 from the v1 majority rollout). |
+| `runs/phase2_bggate/` | Two-stage step 1 — binary bg-vs-named LightGBM. Used by `predict_with_bg_gate.py`. |
 | `submissions/phase2_v1_baseline.csv` | The Kaggle submission for Phase 2 v1 (438877 rows). Format-validated against `sample_submission.csv` (matching column order, row count, spot_id ordering, no nulls). |
+| `submissions/phase2_v3_chead.csv` | Phase 2 v3: v1 baseline + cluster heads. **Best LB so far at 0.6171.** |
 
 ## Typical Phase 2 workflow
 
@@ -332,14 +346,23 @@ python3 scripts/phase2/build_expression.py
 # → cache/expression_phase2/<FOV>.npz × 70
 # → cache/phase2_train.npz
 
-# 3. Train classifier (~6 min CPU at subclass level):
+# 2b. (Optional) add per-cell mask volume to the cache so --extras can use it:
+python3 scripts/phase2/augment_train_cache.py
+
+# 3. Train subclass classifier (~6 min CPU):
 python3 scripts/phase2/train_classifier.py --label_level subclass_label
 # → runs/phase2_baseline/
+
+# 3b. Train per-subclass cluster heads (v3 — what gets to 0.6171 LB):
+python3 scripts/phase2/train_cluster_heads.py \
+    --min_cells 20 --run_dir runs/phase2_clusterheads
+# → runs/phase2_clusterheads/
 
 # 4. Validate on the 10 val FOVs (~30 s):
 VAL_FOVS=$(cat phase2_val_fovs.txt | tr '\n' ' ')
 python3 scripts/phase2/predict.py \
     --run_dir runs/phase2_baseline \
+    --cluster_heads_dir runs/phase2_clusterheads \
     --fovs $VAL_FOVS \
     --spots_csv /scratch/pl2820/data/competition_phase2/train/ground_truth/spots_train.csv \
     --output runs/phase2_baseline/val_submission.csv \
@@ -350,10 +373,11 @@ python3 scripts/phase2/local_eval_phase2.py \
 # 5. Generate Kaggle submission (10 test FOVs, ~10 s):
 python3 scripts/phase2/predict.py \
     --run_dir runs/phase2_baseline \
-    --output submissions/phase2_v1_baseline.csv
+    --cluster_heads_dir runs/phase2_clusterheads \
+    --output submissions/phase2_v3_chead.csv
 
 # 6. Submit to Kaggle (or via the web UI):
 kaggle competitions submit -c <competition-name> \
-    -f submissions/phase2_v1_baseline.csv \
-    -m "Phase 2 v1 baseline: subclass LightGBM, local 0.555 / Kaggle 0.61"
+    -f submissions/phase2_v3_chead.csv \
+    -m "Phase 2 v3: subclass LightGBM + cluster heads, LB 0.6171"
 ```
